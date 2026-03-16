@@ -9,6 +9,7 @@ to CSV.
 import argparse
 import csv
 import os
+import ssl
 import time
 import urllib.request
 
@@ -87,7 +88,7 @@ def detect_reference_line(frame, fallback_y=None):
         x1, y1, x2, y2 = line[0]
         dx = abs(x2 - x1)
         dy = abs(y2 - y1)
-        if dx > 0 and (dy / dx) < 0.09:  # ~5 degrees
+        if dx > 1 and (dy / dx) < 0.09:  # ~5 degrees
             horizontal_ys.extend([y1, y2])
 
     if not horizontal_ys:
@@ -261,8 +262,15 @@ def ensure_model(model_path):
 
     print(f"Downloading hand_landmarker.task to {model_path} …")
     try:
-        urllib.request.urlretrieve(MODEL_URL, model_path)
+        ssl_ctx = ssl.create_default_context()
+        req = urllib.request.Request(MODEL_URL)
+        with urllib.request.urlopen(req, context=ssl_ctx) as resp, \
+             open(model_path, "wb") as out:
+            out.write(resp.read())
     except Exception as exc:
+        # Clean up partial download
+        if os.path.isfile(model_path):
+            os.remove(model_path)
         raise RuntimeError(
             f"Failed to download model from {MODEL_URL}: {exc}\n"
             "Download it manually and pass --model-path."

@@ -169,7 +169,7 @@ class TestDetectReferenceLine(unittest.TestCase):
         y = 300
         cv2.line(frame, (0, y), (639, y), (255, 255, 255), 2)
         result = hand_tracker.detect_reference_line(frame, fallback_y=0)
-        self.assertAlmostEqual(result, y, delta=5)
+        self.assertAlmostEqual(result, y, delta=3)
 
     def test_ignores_vertical_lines(self):
         """Vertical lines should not be considered as reference lines."""

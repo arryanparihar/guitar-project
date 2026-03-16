@@ -70,11 +70,21 @@ class AudioEngine:
         Smaller values give finer time resolution but are slower.
     """
 
-    def __init__(self, bpm: float = 120.0, hop_length: int = 512) -> None:
+    def __init__(
+        self,
+        bpm: float = 120.0,
+        hop_length: int = 512,
+        lead_in_ignore_sec: float = 0.1,
+    ) -> None:
         if bpm <= 0:
             raise ValueError(f"BPM must be positive, got {bpm}")
+        if lead_in_ignore_sec < 0:
+            raise ValueError(
+                f"lead_in_ignore_sec must be non-negative, got {lead_in_ignore_sec}"
+            )
         self.bpm = float(bpm)
         self.hop_length = hop_length
+        self.lead_in_ignore_sec = float(lead_in_ignore_sec)
 
     # ------------------------------------------------------------------
     # Public API
@@ -145,7 +155,14 @@ class AudioEngine:
 
         # --- Align onsets to BPM grid ----------------------------------
         beat_period_sec = 60.0 / self.bpm
-        onset_events = self._align_onsets(onset_times, beat_period_sec)
+        onset_events = self._align_onsets(
+            onset_times,
+            beat_period_sec,
+            y,
+            sr,
+            hop_length=self.hop_length,
+            lead_in_ignore_sec=self.lead_in_ignore_sec,
+        )
 
         # --- RMS energy envelope (for waveform display) ----------------
         rms = librosa.feature.rms(y=y, hop_length=self.hop_length)[0]
@@ -180,23 +197,75 @@ class AudioEngine:
     def _align_onsets(
         onset_times: list[float],
         beat_period_sec: float,
+        y: np.ndarray,
+        sr: int,
+        hop_length: int = 512,
+        lead_in_ignore_sec: float = 0.1,
+        anchor_window_sec: float = 2.0,
     ) -> list[OnsetEvent]:
         """
         Snap each onset to the nearest beat in a uniform metronome grid
         and return the deviation from that beat.
 
-        The first onset is used as the grid anchor (phase offset).
+        The grid anchor is the onset with the highest local RMS energy
+        found within the first *anchor_window_sec* seconds of audio,
+        excluding any onsets that occur before *lead_in_ignore_sec*
+        (to skip accidental string noises / lead-in noise).
+
+        If no onset falls in the valid window
+        ``[lead_in_ignore_sec, anchor_window_sec]``, the function falls
+        back to the earliest onset in the recording.
+
+        Parameters
+        ----------
+        onset_times : list[float]
+            Onset times in seconds (ascending order).
+        beat_period_sec : float
+            Duration of one beat in seconds (60 / BPM).
+        y : np.ndarray
+            Mono audio time-series used to evaluate per-onset RMS energy.
+        sr : int
+            Sample rate of *y*.
+        hop_length : int
+            Hop size used when converting times to sample indices.
+        lead_in_ignore_sec : float
+            Onsets earlier than this threshold are excluded from anchor
+            selection (guards against pre-playing noise).
+        anchor_window_sec : float
+            Only onsets up to this many seconds into the recording are
+            considered as anchor candidates.  Defaults to 2.0 s.
         """
         if not onset_times:
             return []
 
-        anchor = onset_times[0]  # treat the first onset as beat 1
-        events: list[OnsetEvent] = []
+        # --- Select anchor candidates: within [lead_in_ignore_sec, anchor_window_sec] ---
+        candidates = [
+            t for t in onset_times
+            if lead_in_ignore_sec <= t <= anchor_window_sec
+        ]
 
+        # Fallback: if no onset lands in the valid window, use the very first onset.
+        if not candidates:
+            candidates = onset_times[:1]
+
+        # --- Choose the loudest candidate as the anchor -----------------
+        def _onset_rms(t: float) -> float:
+            """RMS energy of a short segment centred on onset time *t*."""
+            center = int(t * sr)
+            window_radius = hop_length
+            start = max(0, center - window_radius)
+            end = min(len(y), center + window_radius)
+            segment = y[start:end]
+            if segment.size == 0:
+                return 0.0
+            return float(np.sqrt(np.mean(segment ** 2)))
+
+        anchor = max(candidates, key=_onset_rms)
+
+        # --- Build events relative to the chosen anchor -----------------
+        events: list[OnsetEvent] = []
         for i, t in enumerate(onset_times):
-            # How many beats since the anchor?
             beats_since_anchor = (t - anchor) / beat_period_sec
-            # Round to nearest integer beat
             nearest_beat = round(beats_since_anchor)
             expected_sec = anchor + nearest_beat * beat_period_sec
             deviation_ms = (t - expected_sec) * 1000.0

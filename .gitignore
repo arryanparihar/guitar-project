@@ -1,6 +1,27 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
 *$py.class
 *.egg-info/
 dist/
@@ -15,10 +36,19 @@ env/
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# Output files
-*.csv
-output_*.avi
+# Streamlit
+.streamlit/
 
-# MediaPipe model (downloaded at runtime)
-*.task
+# Temporary / uploaded files
+uploads/
+*.mp4
+*.avi
+*.mov
+*.wav
+*.mp3
+
+# Logs
+*.log

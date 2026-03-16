@@ -202,7 +202,10 @@ def _rms_envelope_chart(audio_result: AudioAnalysisResult) -> go.Figure:
     return fig
 
 
-def _build_finger_height_csv(results: list[FrameResult]) -> bytes:
+def _build_finger_height_csv(
+    results: list[FrameResult],
+    audio_result: Optional[AudioAnalysisResult] = None,
+) -> bytes:
     """
     Convert vision analysis results to a UTF-8 encoded CSV suitable for
     download via ``st.download_button``.
@@ -211,8 +214,19 @@ def _build_finger_height_csv(results: list[FrameResult]) -> bytes:
     -------
     frame_index, timestamp_sec, avg_finger_height_px, efficiency_score,
     index_x, index_y, middle_x, middle_y, ring_x, ring_y, pinky_x, pinky_y
+    [, Audio_Deviation_ms]  – only present when *audio_result* is supplied
+                              and contains at least one onset event.
+
+    For each video frame the ``Audio_Deviation_ms`` value is taken from the
+    audio onset whose timestamp is closest to the frame's timestamp.  This
+    creates a unified dataset that correlates hand technique with timing.
     """
     fingertip_names = ("index", "middle", "ring", "pinky")
+
+    include_audio = (
+        audio_result is not None and bool(audio_result.onset_events)
+    )
+
     header = [
         "frame_index",
         "timestamp_sec",
@@ -220,9 +234,17 @@ def _build_finger_height_csv(results: list[FrameResult]) -> bytes:
         "efficiency_score",
     ] + [f"{n}_{axis}" for n in fingertip_names for axis in ("x", "y")]
 
+    if include_audio:
+        header.append("Audio_Deviation_ms")
+
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(header)
+
+    # Pre-extract onset times for fast nearest-neighbour lookup.
+    onset_times: list[float] = (
+        [e.time_sec for e in audio_result.onset_events] if include_audio else []
+    )
 
     for r in results:
         # Build a lookup so missing fingertips are represented as empty cells
@@ -238,6 +260,15 @@ def _build_finger_height_csv(results: list[FrameResult]) -> bytes:
                 row += [round(tip_coords[name][0], 2), round(tip_coords[name][1], 2)]
             else:
                 row += ["", ""]
+
+        if include_audio:
+            # Find the index of the onset whose time is closest to this frame.
+            closest_idx = min(
+                range(len(onset_times)),
+                key=lambda i: abs(onset_times[i] - r.timestamp_sec),
+            )
+            row.append(round(audio_result.onset_events[closest_idx].deviation_ms, 4))
+
         writer.writerow(row)
 
     return buf.getvalue().encode("utf-8")
@@ -526,7 +557,7 @@ def main() -> None:
             st.plotly_chart(_efficiency_score_chart(vision_results), use_container_width=True)
 
             # --- CSV Export ---
-            csv_bytes = _build_finger_height_csv(vision_results)
+            csv_bytes = _build_finger_height_csv(vision_results, audio_result)
             st.download_button(
                 label="⬇️ Export Finger Height data to CSV",
                 data=csv_bytes,
@@ -534,7 +565,9 @@ def main() -> None:
                 mime="text/csv",
                 help=(
                     "Downloads a CSV file with per-frame timestamp, average finger "
-                    "height (px), efficiency score, and individual fingertip coordinates."
+                    "height (px), efficiency score, and individual fingertip coordinates. "
+                    "When audio analysis has been run, an Audio_Deviation_ms column is "
+                    "also included, correlating each frame with the closest note onset."
                 ),
             )
         else:

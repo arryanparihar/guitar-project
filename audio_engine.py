@@ -68,13 +68,29 @@ class AudioEngine:
     hop_length : int
         Hop length (in samples) used for librosa's short-time analyses.
         Smaller values give finer time resolution but are slower.
+    noise_gate_ratio : float
+        Noise gate threshold as a fraction of the peak RMS energy.
+        Onsets whose local RMS energy is below
+        ``noise_gate_ratio * peak_rms`` are discarded as noise
+        (e.g. string squeaks, fret buzz).  Set to 0.0 to disable.
+        Default is 0.15 (15 % of peak volume).
     """
 
-    def __init__(self, bpm: float = 120.0, hop_length: int = 512) -> None:
+    def __init__(
+        self,
+        bpm: float = 120.0,
+        hop_length: int = 512,
+        noise_gate_ratio: float = 0.15,
+    ) -> None:
         if bpm <= 0:
             raise ValueError(f"BPM must be positive, got {bpm}")
+        if not (0.0 <= noise_gate_ratio <= 1.0):
+            raise ValueError(
+                f"noise_gate_ratio must be in [0, 1], got {noise_gate_ratio}"
+            )
         self.bpm = float(bpm)
         self.hop_length = hop_length
+        self.noise_gate_ratio = float(noise_gate_ratio)
 
     # ------------------------------------------------------------------
     # Public API
@@ -124,6 +140,9 @@ class AudioEngine:
     def _analyse(self, y: np.ndarray, sr: int) -> AudioAnalysisResult:
         duration_sec = librosa.get_duration(y=y, sr=sr)
 
+        # --- RMS energy envelope (needed for noise gate + waveform display) ---
+        rms = librosa.feature.rms(y=y, hop_length=self.hop_length)[0]
+
         # --- Onset detection -------------------------------------------
         onset_frames = librosa.onset.onset_detect(
             y=y,
@@ -131,6 +150,12 @@ class AudioEngine:
             hop_length=self.hop_length,
             units="frames",
         )
+
+        # --- Noise gate: discard onsets below the volume threshold -----
+        onset_frames = self._apply_noise_gate(
+            onset_frames, rms, self.noise_gate_ratio
+        )
+
         onset_times = librosa.frames_to_time(
             onset_frames, sr=sr, hop_length=self.hop_length
         ).tolist()
@@ -147,8 +172,7 @@ class AudioEngine:
         beat_period_sec = 60.0 / self.bpm
         onset_events = self._align_onsets(onset_times, beat_period_sec)
 
-        # --- RMS energy envelope (for waveform display) ----------------
-        rms = librosa.feature.rms(y=y, hop_length=self.hop_length)[0]
+        # --- Normalise RMS for waveform display ------------------------
         rms_norm = (rms / (rms.max() + 1e-9)).tolist()
         rms_times = librosa.frames_to_time(
             np.arange(len(rms)), sr=sr, hop_length=self.hop_length
@@ -175,6 +199,47 @@ class AudioEngine:
             avg_deviation_ms=avg_dev,
             timing_score=timing_score,
         )
+
+    @staticmethod
+    def _apply_noise_gate(
+        onset_frames: np.ndarray,
+        rms: np.ndarray,
+        noise_gate_ratio: float,
+    ) -> np.ndarray:
+        """
+        Filter onset frames whose local RMS energy falls below the threshold.
+
+        Parameters
+        ----------
+        onset_frames : np.ndarray
+            Frame indices returned by ``librosa.onset.onset_detect``.
+        rms : np.ndarray
+            Per-frame RMS energy array (1-D) computed with the same
+            ``hop_length`` as the onset detector.
+        noise_gate_ratio : float
+            Fraction of the peak RMS below which an onset is discarded.
+            0.0 disables the gate (all onsets kept).
+
+        Returns
+        -------
+        np.ndarray
+            Filtered subset of *onset_frames*.
+        """
+        if len(onset_frames) == 0 or noise_gate_ratio <= 0.0:
+            return onset_frames
+
+        peak_rms = rms.max()
+        if peak_rms == 0.0:
+            return onset_frames
+
+        threshold = noise_gate_ratio * peak_rms
+        n_rms = len(rms)
+        keep = [
+            frame
+            for frame in onset_frames
+            if int(frame) < n_rms and rms[int(frame)] >= threshold
+        ]
+        return np.array(keep, dtype=onset_frames.dtype)
 
     @staticmethod
     def _align_onsets(

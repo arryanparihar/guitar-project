@@ -211,6 +211,43 @@ def _compute_efficiency(avg_distance_px: float, max_distance_px: float = 120.0) 
 
 
 # ---------------------------------------------------------------------------
+# Hand selection
+# ---------------------------------------------------------------------------
+
+def _select_fretting_hand(all_hand_landmarks: list, frame_width: int) -> list:
+    """
+    Return the hand whose landmarks have the lowest average x pixel coordinate.
+
+    For a right-handed guitarist the fretting (left) hand is always on the
+    left side of the frame, so its landmarks have smaller x-pixel values than
+    those of the picking hand.  By always choosing the hand with the smallest
+    mean x coordinate we guarantee that two-handed techniques (e.g. pinch
+    harmonics) never accidentally switch tracking to the picking hand.
+
+    Parameters
+    ----------
+    all_hand_landmarks : list
+        Non-empty list of hand landmark lists as returned by MediaPipe's
+        ``HandLandmarkerResult.hand_landmarks``.
+    frame_width : int
+        Width of the video frame in pixels.  Used to convert MediaPipe's
+        normalised x coordinates (0–1) to pixel coordinates before averaging.
+
+    Returns
+    -------
+    list
+        The landmark list for the fretting hand.
+    """
+    if len(all_hand_landmarks) == 1:
+        return all_hand_landmarks[0]
+
+    def _avg_x(hand: list) -> float:
+        return sum(lm.x * frame_width for lm in hand) / len(hand)
+
+    return min(all_hand_landmarks, key=_avg_x)
+
+
+# ---------------------------------------------------------------------------
 # Core processing class
 # ---------------------------------------------------------------------------
 
@@ -226,7 +263,10 @@ class VisionEngine:
         not exist at this path, it is downloaded automatically from the
         MediaPipe CDN on first instantiation.
     max_num_hands : int
-        Maximum number of hands to detect (default 1 – only the fretting hand).
+        Maximum number of hands to detect (default 2 – both hands are
+        detected so that ``_select_fretting_hand`` can always pick the
+        correct one even during two-handed techniques such as pinch
+        harmonics).
     min_hand_detection_confidence : float
         Minimum confidence for the initial detection.
     min_tracking_confidence : float
@@ -236,7 +276,7 @@ class VisionEngine:
     def __init__(
         self,
         model_path: str = _MODEL_DEFAULT_PATH,
-        max_num_hands: int = 1,
+        max_num_hands: int = 2,
         min_hand_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
     ) -> None:
@@ -305,8 +345,8 @@ class VisionEngine:
             result.annotated_frame = annotated
             return result
 
-        # Use the first detected hand (fretting hand)
-        hand = detection.hand_landmarks[0]
+        # Use the fretting hand (leftmost on screen = lowest avg x coordinate)
+        hand = _select_fretting_hand(detection.hand_landmarks, w)
 
         # Draw skeleton connections
         _draw_hand_landmarks(annotated, hand, w, h)

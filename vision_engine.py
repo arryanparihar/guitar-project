@@ -57,6 +57,11 @@ FINGERTIP_NAMES = ("index", "middle", "ring", "pinky")
 # constant for documentation purposes and to prevent accidental re-addition).
 _THUMB_TIP_ID = 4  # excluded – thumb is behind the neck and not scored
 
+# Minimum visibility/presence score required to treat a landmark as valid.
+# Landmarks reported with either score below this threshold are flagged as
+# low-confidence and excluded from avg_finger_height / efficiency scoring.
+LANDMARK_CONFIDENCE_THRESHOLD = 0.6
+
 # ---------------------------------------------------------------------------
 # Model file management
 # ---------------------------------------------------------------------------
@@ -99,11 +104,19 @@ def _ensure_model(model_path: str = _MODEL_DEFAULT_PATH) -> str:
 
 @dataclass
 class FingertipData:
-    """Pixel coordinates of a single fingertip in one frame."""
+    """Pixel coordinates of a single fingertip in one frame.
+
+    ``x`` and ``y`` are ``None`` when the landmark's visibility or presence
+    score falls below :data:`LANDMARK_CONFIDENCE_THRESHOLD`, indicating that
+    MediaPipe is not confident the fingertip is actually visible.  Such
+    low-confidence fingertips are excluded from distance and efficiency
+    calculations to prevent corrupted data (e.g. during barre chords where
+    fingers may be partially occluded).
+    """
 
     name: str
-    x: float
-    y: float
+    x: Optional[float]
+    y: Optional[float]
 
 
 @dataclass
@@ -309,9 +322,18 @@ class VisionEngine:
         fingertips: list[FingertipData] = []
         for tip_id, tip_name in zip(FINGERTIP_IDS, FINGERTIP_NAMES):
             lm = hand[tip_id]
-            fx, fy = lm.x * w, lm.y * h
-            fingertips.append(FingertipData(name=tip_name, x=fx, y=fy))
-            cv2.circle(annotated, (int(fx), int(fy)), 6, (0, 0, 255), -1)
+            vis = getattr(lm, "visibility", None)
+            pres = getattr(lm, "presence", None)
+            low_confidence = (
+                (vis is not None and vis < LANDMARK_CONFIDENCE_THRESHOLD)
+                or (pres is not None and pres < LANDMARK_CONFIDENCE_THRESHOLD)
+            )
+            if low_confidence:
+                fingertips.append(FingertipData(name=tip_name, x=None, y=None))
+            else:
+                fx, fy = lm.x * w, lm.y * h
+                fingertips.append(FingertipData(name=tip_name, x=fx, y=fy))
+                cv2.circle(annotated, (int(fx), int(fy)), 6, (0, 0, 255), -1)
 
         result.fingertips = fingertips
 
@@ -319,6 +341,9 @@ class VisionEngine:
         if fret_lines and fingertips:
             distances: list[float] = []
             for ft in fingertips:
+                if ft.x is None or ft.y is None:
+                    # Low-confidence landmark – skip to avoid corrupted data
+                    continue
                 nearest_line = _nearest_fretboard_line(ft.y, fret_lines)
                 if nearest_line:
                     dist = _point_to_line_distance(ft.x, ft.y, *nearest_line)

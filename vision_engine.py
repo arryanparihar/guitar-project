@@ -10,8 +10,11 @@ Responsibilities
 * Locate the guitar fretboard in each frame using the Hough Line
   Transform (OpenCV).
 * Compute the Euclidean distance between every tracked fingertip and the
-  nearest fretboard line, then aggregate those distances into a
-  per-frame *efficiency score* (lower average distance → higher score).
+  nearest fretboard line, normalise by a per-frame hand-size reference
+  (wrist-to-index-MCP distance), then aggregate those normalised distances
+  into a per-frame *efficiency score* (lower average distance → higher
+  score).  The normalisation makes the metric invariant to the player's
+  distance from the camera.
 * Return structured data that the dashboard (main.py) can plot and
   display.
 
@@ -56,6 +59,11 @@ FINGERTIP_NAMES = ("index", "middle", "ring", "pinky")
 # Landmark index that must never be used for scoring (kept as a named
 # constant for documentation purposes and to prevent accidental re-addition).
 _THUMB_TIP_ID = 4  # excluded – thumb is behind the neck and not scored
+
+# Reference landmarks used to compute a dynamic hand-size scale so that
+# distance metrics are invariant to the player's distance from the camera.
+_WRIST_ID = 0           # WRIST
+_INDEX_MCP_ID = 5       # INDEX_FINGER_MCP
 
 # ---------------------------------------------------------------------------
 # Model file management
@@ -194,19 +202,24 @@ def _nearest_fretboard_line(
 # Efficiency scoring
 # ---------------------------------------------------------------------------
 
-def _compute_efficiency(avg_distance_px: float, max_distance_px: float = 120.0) -> float:
+def _compute_efficiency(avg_distance_norm: float, max_distance_norm: float = 1.0) -> float:
     """
-    Map average fingertip-to-fretboard distance to a 0–100 efficiency score.
+    Map average *normalised* fingertip-to-fretboard distance to a 0–100
+    efficiency score.
 
-    A distance of 0 px → 100 (fingertips resting on the strings).
-    A distance ≥ *max_distance_px* → 0.
+    Distances are expressed as multiples of the wrist-to-index-MCP
+    reference length so that the metric is invariant to the player's
+    distance from the camera.
 
-    The default threshold of 120 px corresponds roughly to the full height
-    of the fretting hand in a typical 640×480 video frame – a distance
-    beyond which the fingers are clearly lifted far off the fretboard.
+    A normalised distance of 0 → 100 (fingertips resting on the strings).
+    A normalised distance ≥ *max_distance_norm* → 0.
+
+    The default threshold of 1.0 means that once the average fingertip
+    is one full wrist-to-MCP length away from the fretboard, the score
+    bottoms out at 0.
     """
-    clamped = min(avg_distance_px, max_distance_px)
-    return round((1.0 - clamped / max_distance_px) * 100.0, 2)
+    clamped = min(avg_distance_norm, max_distance_norm)
+    return round((1.0 - clamped / max_distance_norm) * 100.0, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +315,14 @@ class VisionEngine:
         # Use the first detected hand (fretting hand)
         hand = detection.hand_landmarks[0]
 
+        # Compute dynamic hand-size reference (wrist → index-finger MCP)
+        wrist_lm = hand[_WRIST_ID]
+        mcp_lm = hand[_INDEX_MCP_ID]
+        hand_ref_scale = _euclidean(
+            (wrist_lm.x * w, wrist_lm.y * h),
+            (mcp_lm.x * w, mcp_lm.y * h),
+        )
+
         # Draw skeleton connections
         _draw_hand_landmarks(annotated, hand, w, h)
 
@@ -349,7 +370,14 @@ class VisionEngine:
                 result.fretboard_y = float(
                     np.mean([(ln[1] + ln[3]) / 2 for ln in fret_lines])
                 )
-                result.efficiency_score = _compute_efficiency(avg_dist)
+
+                # Normalise distances by hand reference scale
+                if hand_ref_scale > 0:
+                    norm_distances = [d / hand_ref_scale for d in distances]
+                else:
+                    norm_distances = distances
+                avg_norm_dist = float(np.mean(norm_distances))
+                result.efficiency_score = _compute_efficiency(avg_norm_dist)
 
                 # Overlay score on frame
                 cv2.putText(

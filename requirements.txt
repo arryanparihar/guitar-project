@@ -5,3 +5,4 @@ numpy>=1.24.0
 streamlit>=1.28.0
 plotly>=5.17.0
 soundfile>=0.12.1
+numpy>=1.24.0

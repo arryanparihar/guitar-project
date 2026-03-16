@@ -22,6 +22,16 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.env/
+env/
 
 # IDE
 .vscode/

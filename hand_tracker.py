@@ -1,26 +1,104 @@
 """Hand landmark tracking for guitar playing analysis.
 
-Uses OpenCV and MediaPipe to track fingertip positions relative to a
-horizontal reference line (guitar string) and logs distances to CSV.
+Uses the MediaPipe Tasks ``HandLandmarker`` API and OpenCV to track the
+four fretting-hand fingertips (index, middle, ring, pinky) relative to
+a dynamically detected guitar string reference line and logs distances
+to CSV.
 """
 
 import argparse
 import csv
+import os
 import time
+import urllib.request
 
 import cv2
 import mediapipe as mp
+import numpy as np
 
-# MediaPipe hand landmark indices for each fingertip
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# MediaPipe hand-landmark indices (Tasks API uses plain int indices)
 FINGER_TIPS = {
-    "Thumb": mp.solutions.hands.HandLandmark.THUMB_TIP,
-    "Index": mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,
-    "Middle": mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP,
-    "Ring": mp.solutions.hands.HandLandmark.RING_FINGER_TIP,
-    "Pinky": mp.solutions.hands.HandLandmark.PINKY_TIP,
+    "Index": 8,
+    "Middle": 12,
+    "Ring": 16,
+    "Pinky": 20,
 }
 
 CSV_HEADER = ["timestamp"] + [f"{name}_distance" for name in FINGER_TIPS]
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+)
+DEFAULT_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task"
+)
+
+# ---------------------------------------------------------------------------
+# Hough-based reference-line detection
+# ---------------------------------------------------------------------------
+
+
+def detect_reference_line(frame, fallback_y=None):
+    """Detect the most prominent horizontal line in *frame*.
+
+    Uses a Canny edge detector followed by a Probabilistic Hough Line
+    Transform to find near-horizontal lines (e.g. guitar strings).
+    The median Y-coordinate of all qualifying line endpoints is returned
+    as the reference-line position.
+
+    Parameters
+    ----------
+    frame : numpy.ndarray
+        BGR video frame.
+    fallback_y : int or None
+        Value returned when no line is detected.  When *None* the
+        vertical centre of the frame is used.
+
+    Returns
+    -------
+    int or None
+        Y-coordinate of the detected reference line, or *fallback_y*.
+    """
+    if fallback_y is None:
+        fallback_y = frame.shape[0] // 2
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=80,
+        minLineLength=frame.shape[1] // 4,
+        maxLineGap=20,
+    )
+
+    if lines is None:
+        return fallback_y
+
+    # Keep only near-horizontal lines (slope within ~5°)
+    horizontal_ys = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if dx > 0 and (dy / dx) < 0.09:  # ~5 degrees
+            horizontal_ys.extend([y1, y2])
+
+    if not horizontal_ys:
+        return fallback_y
+
+    return int(np.median(horizontal_ys))
+
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
 
 
 def compute_distances_from_landmarks(hand_landmarks, frame_width, frame_height,
@@ -29,8 +107,9 @@ def compute_distances_from_landmarks(hand_landmarks, frame_width, frame_height,
 
     Parameters
     ----------
-    hand_landmarks : mediapipe NormalizedLandmarkList
-        The ``.landmark`` attribute of a detected hand.
+    hand_landmarks : list[mediapipe.tasks.components.containers.NormalizedLandmark]
+        List of 21 normalised hand landmarks returned by
+        ``HandLandmarkerResult.hand_landmarks[i]``.
     frame_width : int
         Width of the video frame in pixels.
     frame_height : int
@@ -45,7 +124,7 @@ def compute_distances_from_landmarks(hand_landmarks, frame_width, frame_height,
     """
     distances = {}
     for name, landmark_id in FINGER_TIPS.items():
-        lm = hand_landmarks.landmark[landmark_id]
+        lm = hand_landmarks[landmark_id]
         px = int(lm.x * frame_width)
         py = int(lm.y * frame_height)
         distances[name] = (px, py, abs(py - reference_y))
@@ -97,6 +176,11 @@ def write_csv_row(writer, timestamp, distances):
     writer.writerow(row)
 
 
+# ---------------------------------------------------------------------------
+# CLI & video helpers
+# ---------------------------------------------------------------------------
+
+
 def build_arg_parser():
     """Build and return the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -108,13 +192,13 @@ def build_arg_parser():
              "Default: 0 (webcam)."
     )
     parser.add_argument(
-        "--ref-y", type=int, default=None,
-        help="Y-coordinate for the reference line in pixels. "
-             "Default: middle of the frame."
-    )
-    parser.add_argument(
         "--csv-output", type=str, default="finger_distances.csv",
         help="Path for the output CSV file. Default: finger_distances.csv"
+    )
+    parser.add_argument(
+        "--model-path", type=str, default=DEFAULT_MODEL_PATH,
+        help="Path to the hand_landmarker.task model file. "
+             "Downloaded automatically if missing."
     )
     parser.add_argument(
         "--max-hands", type=int, default=1, choices=[1, 2],
@@ -122,7 +206,7 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--min-detection-confidence", type=float, default=0.7,
-        help="Minimum detection confidence [0-1]. Default: 0.7"
+        help="Minimum hand detection confidence [0-1]. Default: 0.7"
     )
     parser.add_argument(
         "--min-tracking-confidence", type=float, default=0.5,
@@ -144,7 +228,6 @@ def open_video_source(source):
     RuntimeError
         If the source cannot be opened.
     """
-    # Try to interpret as an integer camera index
     try:
         source = int(source)
     except ValueError:
@@ -153,6 +236,43 @@ def open_video_source(source):
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video source: {source}")
     return cap
+
+
+def ensure_model(model_path):
+    """Download the hand-landmarker model if it does not exist locally.
+
+    Parameters
+    ----------
+    model_path : str
+        Desired local path for the ``.task`` model file.
+
+    Returns
+    -------
+    str
+        The validated *model_path*.
+
+    Raises
+    ------
+    RuntimeError
+        If the model cannot be downloaded.
+    """
+    if os.path.isfile(model_path):
+        return model_path
+
+    print(f"Downloading hand_landmarker.task to {model_path} …")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, model_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download model from {MODEL_URL}: {exc}\n"
+            "Download it manually and pass --model-path."
+        ) from exc
+    return model_path
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 
 def run(args=None):
@@ -167,18 +287,26 @@ def run(args=None):
     if args is None:
         args = build_arg_parser().parse_args()
 
+    model_path = ensure_model(args.model_path)
+
     cap = open_video_source(args.source)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    reference_y = args.ref_y if args.ref_y is not None else frame_height // 2
 
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=args.max_hands,
-        min_detection_confidence=args.min_detection_confidence,
+    # Build HandLandmarker via the Tasks API
+    BaseOptions = mp.tasks.BaseOptions
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.VIDEO,
+        num_hands=args.max_hands,
+        min_hand_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
     )
+    landmarker = HandLandmarker.create_from_options(options)
 
     csv_file = open(args.csv_output, "w", newline="")
     writer = csv.writer(csv_file)
@@ -187,8 +315,8 @@ def run(args=None):
     start_time = time.time()
     prev_time = start_time
     fps = 0.0
+    reference_y = frame_height // 2  # initial fallback
 
-    print(f"Tracking started – reference line at y={reference_y}")
     print(f"CSV output: {args.csv_output}")
     print("Press 'q' to quit.\n")
 
@@ -198,12 +326,21 @@ def run(args=None):
             if not ret:
                 break
 
-            # Convert BGR -> RGB for MediaPipe
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
-
             current_time = time.time()
             elapsed = current_time - start_time
+            timestamp_ms = int(elapsed * 1000)
+
+            # Dynamically detect reference line via Hough transform
+            reference_y = detect_reference_line(frame,
+                                                fallback_y=reference_y)
+
+            # Convert BGR → RGB and wrap in mp.Image
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB, data=rgb
+            )
+
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             # FPS calculation (exponential moving average)
             dt = current_time - prev_time
@@ -212,10 +349,10 @@ def run(args=None):
                 fps = 0.9 * fps + 0.1 * instant_fps
             prev_time = current_time
 
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
+            if result.hand_landmarks:
+                for landmarks in result.hand_landmarks:
                     distances = compute_distances_from_landmarks(
-                        hand_landmarks, frame_width, frame_height, reference_y
+                        landmarks, frame_width, frame_height, reference_y
                     )
                     draw_overlay(frame, distances, reference_y)
                     write_csv_row(writer, elapsed, distances)
@@ -230,7 +367,7 @@ def run(args=None):
                 break
     finally:
         csv_file.close()
-        hands.close()
+        landmarker.close()
         cap.release()
         cv2.destroyAllWindows()
 

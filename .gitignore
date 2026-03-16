@@ -19,3 +19,6 @@ env/
 # Output files
 *.csv
 output_*.avi
+
+# MediaPipe model (downloaded at runtime)
+*.task

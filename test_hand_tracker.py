@@ -1,13 +1,17 @@
 """Unit tests for hand_tracker core logic.
 
 These tests exercise the pure-computation helpers without requiring a
-camera or GPU – MediaPipe landmarks are replaced by lightweight stubs.
+camera, GPU, or model file – MediaPipe landmarks are replaced by
+lightweight stubs.
 """
 
 import csv
 import io
 import types
 import unittest
+
+import numpy as np
+import cv2
 
 import hand_tracker
 
@@ -26,29 +30,29 @@ class _FakeLandmark:
 
 
 def _make_hand_landmarks(tip_positions):
-    """Build a stub ``hand_landmarks`` object.
+    """Build a stub hand-landmarks list.
 
     Parameters
     ----------
     tip_positions : dict[int, tuple[float, float]]
         Mapping from landmark index to ``(norm_x, norm_y)`` values in
         the [0, 1] range.
+
+    Returns
+    -------
+    list[_FakeLandmark]
+        A 21-element list compatible with the Tasks API result format.
     """
     # MediaPipe hands have 21 landmarks (indices 0-20).
     landmarks = [_FakeLandmark(0.0, 0.0)] * 21
-
-    # Replace the entries we care about.
     landmarks = list(landmarks)  # ensure mutable list
     for idx, (nx, ny) in tip_positions.items():
         landmarks[idx] = _FakeLandmark(nx, ny)
-
-    obj = types.SimpleNamespace()
-    obj.landmark = landmarks
-    return obj
+    return landmarks
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests – compute_distances_from_landmarks
 # ---------------------------------------------------------------------------
 
 class TestComputeDistances(unittest.TestCase):
@@ -61,7 +65,6 @@ class TestComputeDistances(unittest.TestCase):
         norm_y = ref_y / frame_h  # 0.5
 
         positions = {
-            4: (0.1, norm_y),   # Thumb
             8: (0.3, norm_y),   # Index
             12: (0.5, norm_y),  # Middle
             16: (0.7, norm_y),  # Ring
@@ -81,7 +84,6 @@ class TestComputeDistances(unittest.TestCase):
         frame_w, frame_h = 640, 480
 
         positions = {
-            4: (0.5, 100 / 480),   # Thumb at y=100 → dist=100
             8: (0.5, 300 / 480),   # Index at y=300 → dist=100
             12: (0.5, 200 / 480),  # Middle at y=200 → dist=0
             16: (0.5, 50 / 480),   # Ring at y=50 → dist=150
@@ -93,7 +95,6 @@ class TestComputeDistances(unittest.TestCase):
         )
 
         expected = {
-            "Thumb": 100,
             "Index": 100,
             "Middle": 0,
             "Ring": 150,
@@ -104,22 +105,31 @@ class TestComputeDistances(unittest.TestCase):
             self.assertAlmostEqual(dist, exp_dist, delta=1,
                                    msg=f"{name} distance mismatch")
 
-    def test_returns_all_five_fingers(self):
-        """Result should contain exactly the five expected finger names."""
-        positions = {4: (0.5, 0.5), 8: (0.5, 0.5), 12: (0.5, 0.5),
+    def test_returns_four_fingers(self):
+        """Result should contain exactly the four expected finger names."""
+        positions = {8: (0.5, 0.5), 12: (0.5, 0.5),
                      16: (0.5, 0.5), 20: (0.5, 0.5)}
         hand = _make_hand_landmarks(positions)
         result = hand_tracker.compute_distances_from_landmarks(
             hand, 640, 480, 240
         )
         self.assertEqual(set(result.keys()),
-                         {"Thumb", "Index", "Middle", "Ring", "Pinky"})
+                         {"Index", "Middle", "Ring", "Pinky"})
+
+    def test_thumb_not_tracked(self):
+        """Thumb should NOT appear in the result."""
+        positions = {4: (0.5, 0.5), 8: (0.5, 0.5), 12: (0.5, 0.5),
+                     16: (0.5, 0.5), 20: (0.5, 0.5)}
+        hand = _make_hand_landmarks(positions)
+        result = hand_tracker.compute_distances_from_landmarks(
+            hand, 640, 480, 240
+        )
+        self.assertNotIn("Thumb", result)
 
     def test_pixel_coordinates(self):
         """Pixel x/y should be landmark * frame dimension."""
         frame_w, frame_h = 640, 480
         positions = {
-            4: (0.25, 0.75),
             8: (0.25, 0.75),
             12: (0.25, 0.75),
             16: (0.25, 0.75),
@@ -134,6 +144,45 @@ class TestComputeDistances(unittest.TestCase):
             self.assertEqual(py, int(0.75 * frame_h))
 
 
+# ---------------------------------------------------------------------------
+# Tests – detect_reference_line
+# ---------------------------------------------------------------------------
+
+class TestDetectReferenceLine(unittest.TestCase):
+    """Tests for the Hough-based reference-line detector."""
+
+    def test_returns_fallback_on_blank_frame(self):
+        """A blank frame has no edges → fallback_y should be returned."""
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        result = hand_tracker.detect_reference_line(blank, fallback_y=123)
+        self.assertEqual(result, 123)
+
+    def test_returns_midpoint_when_no_fallback(self):
+        """With no fallback and no edges, default to frame midpoint."""
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        result = hand_tracker.detect_reference_line(blank)
+        self.assertEqual(result, 240)
+
+    def test_detects_horizontal_white_line(self):
+        """A bright horizontal line on a dark background should be found."""
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        y = 300
+        cv2.line(frame, (0, y), (639, y), (255, 255, 255), 2)
+        result = hand_tracker.detect_reference_line(frame, fallback_y=0)
+        self.assertAlmostEqual(result, y, delta=5)
+
+    def test_ignores_vertical_lines(self):
+        """Vertical lines should not be considered as reference lines."""
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.line(frame, (320, 0), (320, 479), (255, 255, 255), 2)
+        result = hand_tracker.detect_reference_line(frame, fallback_y=999)
+        self.assertEqual(result, 999)
+
+
+# ---------------------------------------------------------------------------
+# Tests – CSV helpers
+# ---------------------------------------------------------------------------
+
 class TestWriteCsvRow(unittest.TestCase):
     """Tests for write_csv_row."""
 
@@ -146,7 +195,6 @@ class TestWriteCsvRow(unittest.TestCase):
 
     def test_column_order_matches_header(self):
         distances = {
-            "Thumb": (0, 0, 10),
             "Index": (0, 0, 20),
             "Middle": (0, 0, 30),
             "Ring": (0, 0, 40),
@@ -154,10 +202,9 @@ class TestWriteCsvRow(unittest.TestCase):
         }
         row = self._write_one_row(1.2345, distances)
         self.assertEqual(row[0], "1.2345")
-        # Values must follow the FINGER_TIPS key order
         expected_dists = [str(d) for _, d in
                           zip(hand_tracker.FINGER_TIPS,
-                              [10, 20, 30, 40, 50])]
+                              [20, 30, 40, 50])]
         self.assertEqual(row[1:], expected_dists)
 
     def test_missing_finger_defaults_to_zero(self):
@@ -178,6 +225,14 @@ class TestCsvHeader(unittest.TestCase):
         for name in hand_tracker.FINGER_TIPS:
             self.assertIn(f"{name}_distance", hand_tracker.CSV_HEADER)
 
+    def test_no_thumb_in_header(self):
+        """Thumb should not appear in CSV header."""
+        self.assertNotIn("Thumb_distance", hand_tracker.CSV_HEADER)
+
+
+# ---------------------------------------------------------------------------
+# Tests – CLI parser
+# ---------------------------------------------------------------------------
 
 class TestBuildArgParser(unittest.TestCase):
     """Smoke-test the CLI argument parser."""
@@ -186,7 +241,7 @@ class TestBuildArgParser(unittest.TestCase):
         parser = hand_tracker.build_arg_parser()
         args = parser.parse_args([])
         self.assertEqual(args.source, "0")
-        self.assertIsNone(args.ref_y)
+        self.assertFalse(hasattr(args, "ref_y"))
         self.assertEqual(args.csv_output, "finger_distances.csv")
         self.assertEqual(args.max_hands, 1)
         self.assertAlmostEqual(args.min_detection_confidence, 0.7)
@@ -196,14 +251,18 @@ class TestBuildArgParser(unittest.TestCase):
         parser = hand_tracker.build_arg_parser()
         args = parser.parse_args([
             "--source", "video.mp4",
-            "--ref-y", "300",
             "--csv-output", "out.csv",
             "--max-hands", "2",
         ])
         self.assertEqual(args.source, "video.mp4")
-        self.assertEqual(args.ref_y, 300)
         self.assertEqual(args.csv_output, "out.csv")
         self.assertEqual(args.max_hands, 2)
+
+    def test_no_ref_y_flag(self):
+        """--ref-y should no longer be accepted."""
+        parser = hand_tracker.build_arg_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--ref-y", "300"])
 
 
 if __name__ == "__main__":

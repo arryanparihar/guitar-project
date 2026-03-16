@@ -124,9 +124,10 @@ class AudioEngine:
     def _analyse(self, y: np.ndarray, sr: int) -> AudioAnalysisResult:
         duration_sec = librosa.get_duration(y=y, sr=sr)
 
-        # --- Onset detection -------------------------------------------
+        # --- Onset detection (harmonic-aware) --------------------------
+        onset_strength = self._harmonic_onset_strength(y, sr)
         onset_frames = librosa.onset.onset_detect(
-            y=y,
+            onset_envelope=onset_strength,
             sr=sr,
             hop_length=self.hop_length,
             units="frames",
@@ -175,6 +176,70 @@ class AudioEngine:
             avg_deviation_ms=avg_dev,
             timing_score=timing_score,
         )
+
+    def _harmonic_onset_strength(self, y: np.ndarray, sr: int) -> np.ndarray:
+        """
+        Compute a combined onset strength envelope sensitive to guitar harmonics.
+
+        Guitar harmonics lack a strong broadband transient but produce a
+        concentrated spike in high-frequency energy.  This method:
+
+        1. Builds a full Mel spectrogram.
+        2. Restricts it to Mel bins whose centre frequency is above 2000 Hz
+           (the high-frequency band where harmonics bloom).
+        3. Computes spectral flux (``librosa.onset.onset_strength``) over those
+           bins alone.
+        4. Normalises the high-frequency flux to [0, 1].
+        5. Normalises the per-frame RMS energy to [0, 1].
+        6. Returns the element-wise mean of the two normalised signals so that
+           both broadband energy changes *and* harmonic blooms contribute to
+           onset detection.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Mono audio time-series.
+        sr : int
+            Sample rate.
+
+        Returns
+        -------
+        np.ndarray
+            1-D onset strength envelope, one value per analysis frame.
+        """
+        n_mels = 128
+
+        # --- High-frequency Mel spectrogram flux ----------------------------
+        mel_spec = librosa.feature.melspectrogram(
+            y=y, sr=sr, hop_length=self.hop_length, n_mels=n_mels
+        )
+        mel_freqs = librosa.mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sr / 2.0)
+        hf_mask = mel_freqs > 2000.0
+        hf_mel_spec = mel_spec[hf_mask, :]  # (n_hf_bins, n_frames)
+
+        hf_onset_env = librosa.onset.onset_strength(
+            S=librosa.power_to_db(hf_mel_spec),
+            sr=sr,
+            hop_length=self.hop_length,
+        )
+
+        # --- RMS energy envelope -------------------------------------------
+        rms = librosa.feature.rms(y=y, hop_length=self.hop_length)[0]
+
+        # Align lengths (onset_strength may produce a different frame count)
+        min_len = min(len(hf_onset_env), len(rms))
+        hf_onset_env = hf_onset_env[:min_len]
+        rms = rms[:min_len]
+
+        # --- Normalise both signals to [0, 1] and combine ------------------
+        def _norm(x: np.ndarray) -> np.ndarray:
+            peak = float(x.max())
+            if peak < 1e-9:
+                return np.zeros_like(x)
+            return x / peak
+
+        combined = (_norm(hf_onset_env) + _norm(rms)) / 2.0
+        return combined
 
     @staticmethod
     def _align_onsets(

@@ -23,32 +23,6 @@ FINGER_TIPS = {
 CSV_HEADER = ["timestamp"] + [f"{name}_distance" for name in FINGER_TIPS]
 
 
-def compute_distances(hand_landmarks, frame_height, reference_y):
-    """Return a dict mapping finger name to pixel distance from *reference_y*.
-
-    Parameters
-    ----------
-    hand_landmarks : mediapipe NormalizedLandmarkList
-        The ``.landmark`` attribute of a detected hand.
-    frame_height : int
-        Height of the video frame in pixels.
-    reference_y : int
-        Y-coordinate (in pixels) of the horizontal reference line.
-
-    Returns
-    -------
-    dict[str, tuple[int, int, int]]
-        ``{finger_name: (pixel_x, pixel_y, distance)}``
-    """
-    distances = {}
-    for name, landmark_id in FINGER_TIPS.items():
-        lm = hand_landmarks.landmark[landmark_id]
-        px = int(lm.x * frame_height)  # will be corrected by caller
-        py = int(lm.y * frame_height)
-        distances[name] = (px, py, abs(py - reference_y))
-    return distances
-
-
 def compute_distances_from_landmarks(hand_landmarks, frame_width, frame_height,
                                      reference_y):
     """Return finger distances using correct width/height mapping.

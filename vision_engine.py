@@ -160,8 +160,9 @@ def detect_fretboard_lines(gray_frame: np.ndarray) -> list[tuple[float, float, f
     Detect near-horizontal lines in *gray_frame* using the Probabilistic
     Hough Line Transform and return them as a list of (x1, y1, x2, y2) tuples.
 
-    Only lines whose angle deviates ≤ 20° from horizontal are kept, so
-    that vertical artefacts (e.g. frets) are filtered out.
+    Only lines whose angle deviates ≤ 45° from horizontal are kept, so
+    that vertical artefacts (e.g. frets) are filtered out while still
+    accommodating guitarists who hold the neck at a steep angle.
     """
     blurred = cv2.GaussianBlur(gray_frame, (5, 5), 0)
     edges = cv2.Canny(blurred, threshold1=50, threshold2=150)
@@ -182,7 +183,7 @@ def detect_fretboard_lines(gray_frame: np.ndarray) -> list[tuple[float, float, f
     for line in raw_lines:
         x1, y1, x2, y2 = map(float, line[0])
         angle_deg = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
-        if angle_deg <= 20 or angle_deg >= 160:
+        if angle_deg <= 45 or angle_deg >= 135:
             lines.append((x1, y1, x2, y2))
 
     return lines
@@ -262,6 +263,7 @@ class VisionEngine:
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = HandLandmarker.create_from_options(options)
+        self._last_fret_lines: list[tuple[float, float, float, float]] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -300,6 +302,10 @@ class VisionEngine:
 
         # --- 1. Fretboard detection ------------------------------------------
         fret_lines = detect_fretboard_lines(gray)
+        if fret_lines:
+            self._last_fret_lines = fret_lines
+        elif self._last_fret_lines:
+            fret_lines = self._last_fret_lines
         for x1, y1, x2, y2 in fret_lines:
             cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 1)
 

@@ -9,9 +9,11 @@ Responsibilities
   MediaPipe's Hand Landmarker (Tasks API).
 * Locate the guitar fretboard in each frame using the Hough Line
   Transform (OpenCV).
-* Compute the Euclidean distance between every tracked fingertip and the
-  nearest fretboard line, then aggregate those distances into a
-  per-frame *efficiency score* (lower average distance → higher score).
+* Compute the 3D Euclidean distance between every tracked fingertip and the
+  nearest fretboard line (incorporating the MediaPipe z depth coordinate so
+  the metric is accurate regardless of perspective distortion along the guitar
+  neck), then aggregate those distances into a per-frame *efficiency score*
+  (lower average distance → higher score).
 * Return structured data that the dashboard (main.py) can plot and
   display.
 
@@ -99,11 +101,12 @@ def _ensure_model(model_path: str = _MODEL_DEFAULT_PATH) -> str:
 
 @dataclass
 class FingertipData:
-    """Pixel coordinates of a single fingertip in one frame."""
+    """Pixel coordinates and depth of a single fingertip in one frame."""
 
     name: str
     x: float
     y: float
+    z: float = 0.0  # depth relative to the wrist, scaled to pixel units (lm.z * frame_width)
 
 
 @dataclass
@@ -114,7 +117,7 @@ class FrameResult:
     timestamp_sec: float
     fingertips: list[FingertipData] = field(default_factory=list)
     fretboard_y: Optional[float] = None          # y-coordinate of the nearest fretboard line
-    avg_finger_height: Optional[float] = None    # mean distance (pixels) of fingertips from fretboard
+    avg_finger_height: Optional[float] = None    # mean 3D distance (pixels) of fingertips from fretboard
     efficiency_score: Optional[float] = None     # 0–100 score for this frame
     annotated_frame: Optional[np.ndarray] = None # BGR image with drawn overlays
 
@@ -125,17 +128,23 @@ class FrameResult:
 
 def _point_to_line_distance(px: float, py: float,
                              x1: float, y1: float,
-                             x2: float, y2: float) -> float:
-    """Return the perpendicular distance from point (px, py) to line (x1,y1)–(x2,y2)."""
+                             x2: float, y2: float,
+                             pz: float = 0.0) -> float:
+    """Return the 3D Euclidean distance from point (px, py, pz) to line (x1,y1)–(x2,y2).
+
+    The fretboard line lies in the image plane (z = 0), so the 3D distance
+    is ``sqrt(2D_perpendicular_distance² + pz²)``.  When *pz* is 0 the
+    result is identical to the previous 2D calculation.
+    """
     dx = x2 - x1
     dy = y2 - y1
     if dx == 0 and dy == 0:
-        return math.hypot(px - x1, py - y1)
+        return math.sqrt((px - x1) ** 2 + (py - y1) ** 2 + pz ** 2)
     t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
     t = max(0.0, min(1.0, t))
     nearest_x = x1 + t * dx
     nearest_y = y1 + t * dy
-    return math.hypot(px - nearest_x, py - nearest_y)
+    return math.sqrt((px - nearest_x) ** 2 + (py - nearest_y) ** 2 + pz ** 2)
 
 
 def _euclidean(p1: tuple[float, float], p2: tuple[float, float]) -> float:
@@ -310,7 +319,8 @@ class VisionEngine:
         for tip_id, tip_name in zip(FINGERTIP_IDS, FINGERTIP_NAMES):
             lm = hand[tip_id]
             fx, fy = lm.x * w, lm.y * h
-            fingertips.append(FingertipData(name=tip_name, x=fx, y=fy))
+            fz = lm.z * w  # depth scaled by frame width (same normalisation as x)
+            fingertips.append(FingertipData(name=tip_name, x=fx, y=fy, z=fz))
             cv2.circle(annotated, (int(fx), int(fy)), 6, (0, 0, 255), -1)
 
         result.fingertips = fingertips
@@ -321,7 +331,7 @@ class VisionEngine:
             for ft in fingertips:
                 nearest_line = _nearest_fretboard_line(ft.y, fret_lines)
                 if nearest_line:
-                    dist = _point_to_line_distance(ft.x, ft.y, *nearest_line)
+                    dist = _point_to_line_distance(ft.x, ft.y, *nearest_line, ft.z)
                     distances.append(dist)
                     # Project fingertip vertically onto the nearest fretboard line
                     x1, y1, x2, y2 = nearest_line

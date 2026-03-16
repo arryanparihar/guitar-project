@@ -152,10 +152,17 @@ def detect_fretboard_lines(gray_frame: np.ndarray) -> list[tuple[float, float, f
     Detect near-horizontal lines in *gray_frame* using the Probabilistic
     Hough Line Transform and return them as a list of (x1, y1, x2, y2) tuples.
 
+    CLAHE (Contrast Limited Adaptive Histogram Equalization) is applied first
+    to boost local contrast between guitar strings and the fretboard.  This
+    makes the subsequent Canny / Hough steps robust under poor lighting
+    conditions (e.g. dark fretboards in dim bedroom lighting).
+
     Only lines whose angle deviates ≤ 20° from horizontal are kept, so
     that vertical artefacts (e.g. frets) are filtered out.
     """
-    blurred = cv2.GaussianBlur(gray_frame, (5, 5), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    equalized = clahe.apply(gray_frame)
+    blurred = cv2.GaussianBlur(equalized, (5, 5), 0)
     edges = cv2.Canny(blurred, threshold1=50, threshold2=150)
 
     raw_lines = cv2.HoughLinesP(

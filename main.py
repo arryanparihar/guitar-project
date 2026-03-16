@@ -20,6 +20,8 @@ Features
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import tempfile
 from typing import Optional
@@ -200,6 +202,47 @@ def _rms_envelope_chart(audio_result: AudioAnalysisResult) -> go.Figure:
     return fig
 
 
+def _build_finger_height_csv(results: list[FrameResult]) -> bytes:
+    """
+    Convert vision analysis results to a UTF-8 encoded CSV suitable for
+    download via ``st.download_button``.
+
+    Columns
+    -------
+    frame_index, timestamp_sec, avg_finger_height_px, efficiency_score,
+    index_x, index_y, middle_x, middle_y, ring_x, ring_y, pinky_x, pinky_y
+    """
+    fingertip_names = ("index", "middle", "ring", "pinky")
+    header = [
+        "frame_index",
+        "timestamp_sec",
+        "avg_finger_height_px",
+        "efficiency_score",
+    ] + [f"{n}_{axis}" for n in fingertip_names for axis in ("x", "y")]
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+
+    for r in results:
+        # Build a lookup so missing fingertips are represented as empty cells
+        tip_coords: dict[str, tuple] = {ft.name: (ft.x, ft.y) for ft in r.fingertips}
+        row = [
+            r.frame_index,
+            round(r.timestamp_sec, 6),
+            round(r.avg_finger_height, 4) if r.avg_finger_height is not None else "",
+            round(r.efficiency_score, 4) if r.efficiency_score is not None else "",
+        ]
+        for name in fingertip_names:
+            if name in tip_coords:
+                row += [round(tip_coords[name][0], 2), round(tip_coords[name][1], 2)]
+            else:
+                row += ["", ""]
+        writer.writerow(row)
+
+    return buf.getvalue().encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Video processing helpers
 # ---------------------------------------------------------------------------
@@ -293,7 +336,7 @@ def _run_webcam_session(
                     frame_placeholder.image(
                         rgb,
                         caption=f"Frame {captured}/{num_frames}",
-                        use_column_width=True,
+                        use_container_width=True,
                     )
         finally:
             cap.release()
@@ -481,6 +524,19 @@ def main() -> None:
         if scored_results:
             st.plotly_chart(_finger_height_chart(vision_results), use_container_width=True)
             st.plotly_chart(_efficiency_score_chart(vision_results), use_container_width=True)
+
+            # --- CSV Export ---
+            csv_bytes = _build_finger_height_csv(vision_results)
+            st.download_button(
+                label="⬇️ Export Finger Height data to CSV",
+                data=csv_bytes,
+                file_name="syncopateai_finger_height.csv",
+                mime="text/csv",
+                help=(
+                    "Downloads a CSV file with per-frame timestamp, average finger "
+                    "height (px), efficiency score, and individual fingertip coordinates."
+                ),
+            )
         else:
             st.info(
                 "No fretboard or hand was detected in the processed frames.  "

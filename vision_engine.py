@@ -45,9 +45,17 @@ from mediapipe.tasks.python.vision import (
 # ---------------------------------------------------------------------------
 # Landmark index constants (MediaPipe 21-point hand model)
 # ---------------------------------------------------------------------------
-# Fingertip landmark indices (index, middle, ring, pinky)
-FINGERTIP_IDS = (8, 12, 16, 20)
+# Fingertip landmark indices for the four FRETTING fingers only.
+# Landmark 4 (THUMB_TIP) is intentionally excluded: when playing guitar
+# the thumb rests behind the neck and is often occluded.  Including it
+# would distort the distance-to-fretboard calculation and produce
+# inaccurate efficiency scores.
+FINGERTIP_IDS = (8, 12, 16, 20)   # INDEX, MIDDLE, RING, PINKY
 FINGERTIP_NAMES = ("index", "middle", "ring", "pinky")
+
+# Landmark index that must never be used for scoring (kept as a named
+# constant for documentation purposes and to prevent accidental re-addition).
+_THUMB_TIP_ID = 4  # excluded – thumb is behind the neck and not scored
 
 # ---------------------------------------------------------------------------
 # Model file management

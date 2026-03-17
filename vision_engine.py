@@ -10,8 +10,11 @@ Responsibilities
 * Locate the guitar fretboard in each frame using the Hough Line
   Transform (OpenCV).
 * Compute the Euclidean distance between every tracked fingertip and the
-  nearest fretboard line, then aggregate those distances into a
-  per-frame *efficiency score* (lower average distance → higher score).
+  nearest fretboard line, normalise by a per-frame hand-size reference
+  (wrist-to-index-MCP distance), then aggregate those normalised distances
+  into a per-frame *efficiency score* (lower average distance → higher
+  score).  The normalisation makes the metric invariant to the player's
+  distance from the camera.
 * Return structured data that the dashboard (main.py) can plot and
   display.
 
@@ -53,9 +56,32 @@ from mediapipe.tasks.python.vision import (
 FINGERTIP_IDS = (8, 12, 16, 20)   # INDEX, MIDDLE, RING, PINKY
 FINGERTIP_NAMES = ("index", "middle", "ring", "pinky")
 
+# ---------------------------------------------------------------------------
+# Velocity Exemption constants (Harmonic Release detection)
+# ---------------------------------------------------------------------------
+# Minimum fingertip speed (pixels per frame) that qualifies as a fast
+# release.  A guitarist pulling their hand away from the fretboard to let
+# a natural harmonic ring will typically exceed this in a 640×480 stream
+# at 30 fps.
+HARMONIC_VELOCITY_THRESHOLD: float = 15.0  # pixels per frame
+
+# How long (seconds) to suspend the efficiency penalty after a Harmonic
+# Release is flagged.
+HARMONIC_RELEASE_DURATION_SEC: float = 1.5
+
+# Maximum age of a registered audio onset (seconds) that is still
+# considered "immediately before" a high-velocity release.  Onsets older
+# than this value are discarded before the velocity check.
+ONSET_LOOKBACK_SEC: float = 0.5
+
 # Landmark index that must never be used for scoring (kept as a named
 # constant for documentation purposes and to prevent accidental re-addition).
 _THUMB_TIP_ID = 4  # excluded – thumb is behind the neck and not scored
+
+# Reference landmarks used to compute a dynamic hand-size scale so that
+# distance metrics are invariant to the player's distance from the camera.
+_WRIST_ID = 0           # WRIST
+_INDEX_MCP_ID = 5       # INDEX_FINGER_MCP
 
 # ---------------------------------------------------------------------------
 # Model file management
@@ -116,6 +142,7 @@ class FrameResult:
     fretboard_y: Optional[float] = None          # y-coordinate of the nearest fretboard line
     avg_finger_height: Optional[float] = None    # mean distance (pixels) of fingertips from fretboard
     efficiency_score: Optional[float] = None     # 0–100 score for this frame
+    harmonic_release: bool = False               # True when velocity-exemption window is active
     annotated_frame: Optional[np.ndarray] = None # BGR image with drawn overlays
 
 
@@ -152,8 +179,9 @@ def detect_fretboard_lines(gray_frame: np.ndarray) -> list[tuple[float, float, f
     Detect near-horizontal lines in *gray_frame* using the Probabilistic
     Hough Line Transform and return them as a list of (x1, y1, x2, y2) tuples.
 
-    Only lines whose angle deviates ≤ 20° from horizontal are kept, so
-    that vertical artefacts (e.g. frets) are filtered out.
+    Only lines whose angle deviates ≤ 45° from horizontal are kept, so
+    that vertical artefacts (e.g. frets) are filtered out while still
+    accommodating guitarists who hold the neck at a steep angle.
     """
     blurred = cv2.GaussianBlur(gray_frame, (5, 5), 0)
     edges = cv2.Canny(blurred, threshold1=50, threshold2=150)
@@ -174,7 +202,7 @@ def detect_fretboard_lines(gray_frame: np.ndarray) -> list[tuple[float, float, f
     for line in raw_lines:
         x1, y1, x2, y2 = map(float, line[0])
         angle_deg = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
-        if angle_deg <= 20 or angle_deg >= 160:
+        if angle_deg <= 45 or angle_deg >= 135:
             lines.append((x1, y1, x2, y2))
 
     return lines
@@ -194,19 +222,24 @@ def _nearest_fretboard_line(
 # Efficiency scoring
 # ---------------------------------------------------------------------------
 
-def _compute_efficiency(avg_distance_px: float, max_distance_px: float = 120.0) -> float:
+def _compute_efficiency(avg_distance_norm: float, max_distance_norm: float = 1.0) -> float:
     """
-    Map average fingertip-to-fretboard distance to a 0–100 efficiency score.
+    Map average *normalised* fingertip-to-fretboard distance to a 0–100
+    efficiency score.
 
-    A distance of 0 px → 100 (fingertips resting on the strings).
-    A distance ≥ *max_distance_px* → 0.
+    Distances are expressed as multiples of the wrist-to-index-MCP
+    reference length so that the metric is invariant to the player's
+    distance from the camera.
 
-    The default threshold of 120 px corresponds roughly to the full height
-    of the fretting hand in a typical 640×480 video frame – a distance
-    beyond which the fingers are clearly lifted far off the fretboard.
+    A normalised distance of 0 → 100 (fingertips resting on the strings).
+    A normalised distance ≥ *max_distance_norm* → 0.
+
+    The default threshold of 1.0 means that once the average fingertip
+    is one full wrist-to-MCP length away from the fretboard, the score
+    bottoms out at 0.
     """
-    clamped = min(avg_distance_px, max_distance_px)
-    return round((1.0 - clamped / max_distance_px) * 100.0, 2)
+    clamped = min(avg_distance_norm, max_distance_norm)
+    return round((1.0 - clamped / max_distance_norm) * 100.0, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +288,16 @@ class VisionEngine:
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = HandLandmarker.create_from_options(options)
+        self._last_fret_lines: list[tuple[float, float, float, float]] = []
+
+        # --- Velocity-exemption state (Harmonic Release detection) -----------
+        # Maps fingertip name → pixel coords from the previous processed frame.
+        self._prev_fingertip_positions: dict[str, tuple[float, float]] = {}
+        # Audio onset timestamps registered via register_onset().
+        self._recent_onsets: list[float] = []
+        # Absolute timestamp (seconds) until which the efficiency penalty is
+        # suspended.  Negative means no active exemption.
+        self._harmonic_release_until: float = -1.0
 
         if not (0.0 < fretboard_ema_alpha <= 1.0):
             raise ValueError(
@@ -269,6 +312,25 @@ class VisionEngine:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def register_onset(self, onset_time_sec: float) -> None:
+        """
+        Register a detected audio onset for harmonic-release detection.
+
+        Call this whenever the audio engine reports a note onset.  If a
+        fingertip subsequently moves away from the fretboard at an
+        exceptionally high velocity within :data:`ONSET_LOOKBACK_SEC`
+        seconds of *onset_time_sec*, ``process_frame`` will flag the result
+        as a ``harmonic_release`` and suspend the efficiency penalty for the
+        following :data:`HARMONIC_RELEASE_DURATION_SEC` seconds.
+
+        Parameters
+        ----------
+        onset_time_sec : float
+            Onset time in seconds (must share the same time-base as the
+            ``timestamp_sec`` values produced by ``process_frame``).
+        """
+        self._recent_onsets.append(onset_time_sec)
 
     def process_frame(
         self,
@@ -303,6 +365,10 @@ class VisionEngine:
 
         # --- 1. Fretboard detection ------------------------------------------
         fret_lines = detect_fretboard_lines(gray)
+        if fret_lines:
+            self._last_fret_lines = fret_lines
+        elif self._last_fret_lines:
+            fret_lines = self._last_fret_lines
         for x1, y1, x2, y2 in fret_lines:
             cv2.line(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 1)
 
@@ -312,11 +378,22 @@ class VisionEngine:
         detection = self._landmarker.detect(mp_image)
 
         if not detection.hand_landmarks:
+            # No hand visible – reset velocity tracking so the next detected
+            # frame starts fresh rather than computing an erroneous delta.
+            self._prev_fingertip_positions = {}
             result.annotated_frame = annotated
             return result
 
         # Use the first detected hand (fretting hand)
         hand = detection.hand_landmarks[0]
+
+        # Compute dynamic hand-size reference (wrist → index-finger MCP)
+        wrist_lm = hand[_WRIST_ID]
+        mcp_lm = hand[_INDEX_MCP_ID]
+        hand_ref_scale = _euclidean(
+            (wrist_lm.x * w, wrist_lm.y * h),
+            (mcp_lm.x * w, mcp_lm.y * h),
+        )
 
         # Draw skeleton connections
         _draw_hand_landmarks(annotated, hand, w, h)
@@ -331,6 +408,7 @@ class VisionEngine:
 
         result.fingertips = fingertips
 
+<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
         # --- 4. Update EMA for fretboard y-coordinate -----------------------
         if fret_lines:
             raw_fretboard_y = float(
@@ -344,6 +422,85 @@ class VisionEngine:
                     self._fretboard_ema_alpha * raw_fretboard_y
                     + (1.0 - self._fretboard_ema_alpha) * self._smoothed_fretboard_y
                 )
+=======
+        # --- 3b. Compute fingertip velocities (pixels/frame) ------------------
+        max_fingertip_velocity = 0.0
+        for ft in fingertips:
+            prev = self._prev_fingertip_positions.get(ft.name)
+            if prev is not None:
+                vel = math.hypot(ft.x - prev[0], ft.y - prev[1])
+                if vel > max_fingertip_velocity:
+                    max_fingertip_velocity = vel
+        # Store current positions for the next frame
+        self._prev_fingertip_positions = {ft.name: (ft.x, ft.y) for ft in fingertips}
+
+        # --- 3c. Harmonic Release / Velocity Exemption check -----------------
+        # If we are already inside an active exemption window, honour it.
+        in_harmonic_release = timestamp_sec < self._harmonic_release_until
+        if not in_harmonic_release:
+            # Prune onsets that are too old to be "immediately before" this frame.
+            self._recent_onsets = [
+                t for t in self._recent_onsets
+                if timestamp_sec - t <= ONSET_LOOKBACK_SEC
+            ]
+            # Flag a new Harmonic Release when a fast departure follows an onset.
+            if (
+                max_fingertip_velocity >= HARMONIC_VELOCITY_THRESHOLD
+                and self._recent_onsets
+            ):
+                self._harmonic_release_until = timestamp_sec + HARMONIC_RELEASE_DURATION_SEC
+                in_harmonic_release = True
+
+        result.harmonic_release = in_harmonic_release
+
+        # --- 4. Compute distances to fretboard --------------------------------
+        if fret_lines and fingertips:
+            distances: list[float] = []
+            for ft in fingertips:
+                nearest_line = _nearest_fretboard_line(ft.y, fret_lines)
+                if nearest_line:
+                    dist = _point_to_line_distance(ft.x, ft.y, *nearest_line)
+                    distances.append(dist)
+                    # Project fingertip vertically onto the nearest fretboard line
+                    x1, y1, x2, y2 = nearest_line
+                    dx = x2 - x1
+                    dy = y2 - y1
+                    denom = dx * dx + dy * dy
+                    if denom > 0:
+                        t = ((ft.x - x1) * dx + (ft.y - y1) * dy) / denom
+                        t = max(0.0, min(1.0, t))
+                        proj_x = int(x1 + t * dx)
+                        proj_y = int(y1 + t * dy)
+                    else:
+                        proj_x, proj_y = int(x1), int(y1)
+                    cv2.line(
+                        annotated,
+                        (int(ft.x), int(ft.y)),
+                        (proj_x, proj_y),
+                        (255, 0, 255),
+                        1,
+                    )
+
+            if distances:
+                avg_dist = float(np.mean(distances))
+                result.avg_finger_height = avg_dist
+                result.fretboard_y = float(
+                    np.mean([(ln[1] + ln[3]) / 2 for ln in fret_lines])
+                )
+
+                # Normalise distances by hand reference scale
+                if hand_ref_scale > 0:
+                    norm_distances = [d / hand_ref_scale for d in distances]
+                else:
+                    norm_distances = distances
+                avg_norm_dist = float(np.mean(norm_distances))
+
+                if in_harmonic_release:
+                    # Suspend efficiency penalty – score is 100 for this window.
+                    result.efficiency_score = 100.0
+                else:
+                    result.efficiency_score = _compute_efficiency(avg_norm_dist)
+>>>>>>> main
 
         # --- 5. Compute distances to smoothed fretboard reference line -------
         if self._smoothed_fretboard_y is not None and fingertips:
@@ -370,6 +527,7 @@ class VisionEngine:
                     1,
                 )
 
+<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
             avg_dist = float(np.mean(distances))
             result.avg_finger_height = avg_dist
             result.fretboard_y = ref_y
@@ -385,6 +543,18 @@ class VisionEngine:
                 (0, 255, 0),
                 2,
             )
+=======
+                if in_harmonic_release:
+                    cv2.putText(
+                        annotated,
+                        "Harmonic Release",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                    )
+>>>>>>> main
 
         result.annotated_frame = annotated
         return result

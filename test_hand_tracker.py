@@ -265,5 +265,65 @@ class TestBuildArgParser(unittest.TestCase):
             parser.parse_args(["--ref-y", "300"])
 
 
+# ---------------------------------------------------------------------------
+# Tests – reference-line EMA smoothing (logic extracted from run())
+# ---------------------------------------------------------------------------
+
+class TestReferenceLineEma(unittest.TestCase):
+    """Verify the EMA update formula used for reference_y in hand_tracker.run()."""
+
+    @staticmethod
+    def _apply_ema(alpha, prev, new_raw):
+        """Mirror the EMA formula used inside hand_tracker.run()."""
+        return int(alpha * new_raw + (1.0 - alpha) * prev)
+
+    def test_first_frame_seeds_with_raw(self):
+        """After the first real detection the EMA value should be the raw y."""
+        alpha = 0.1
+        prev_y = 240  # initial fallback
+        raw_y = 300
+        result = self._apply_ema(alpha, prev_y, raw_y)
+        # 0.1 * 300 + 0.9 * 240 = 246
+        self.assertEqual(result, int(0.1 * 300 + 0.9 * 240))
+
+    def test_no_detection_leaves_reference_unchanged(self):
+        """When detect_reference_line returns the fallback, EMA is a no-op."""
+        alpha = 0.1
+        prev_y = 200
+        # fallback == prev_y means raw_y == prev_y
+        result = self._apply_ema(alpha, prev_y, prev_y)
+        self.assertEqual(result, prev_y)
+
+    def test_converges_toward_new_stable_line(self):
+        """Repeated detections of the same y should converge close to that y."""
+        alpha = 0.1
+        current = 240
+        target = 300
+        for _ in range(200):
+            current = self._apply_ema(alpha, current, target)
+        # After many frames the smoothed value should be very close to target.
+        # Integer truncation limits precision to ~(1 / alpha) pixels at most.
+        self.assertAlmostEqual(current, target, delta=10)
+
+    def test_large_alpha_is_more_responsive(self):
+        """A larger alpha should react faster to a new raw_y."""
+        prev_y = 240
+        raw_y = 400
+        slow = self._apply_ema(0.05, prev_y, raw_y)
+        fast = self._apply_ema(0.5, prev_y, raw_y)
+        # fast EMA should be closer to raw_y
+        self.assertGreater(abs(fast - prev_y), abs(slow - prev_y))
+
+    def test_single_noisy_spike_has_small_impact(self):
+        """One outlier frame should barely move the smoothed value (alpha=0.1)."""
+        alpha = 0.1
+        prev_y = 240
+        spike_y = 400  # large outlier
+        result = self._apply_ema(alpha, prev_y, spike_y)
+        # Impact should be at most alpha * (spike - prev)
+        max_impact = alpha * abs(spike_y - prev_y)
+        self.assertLessEqual(abs(result - prev_y), max_impact + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

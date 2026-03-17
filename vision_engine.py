@@ -263,6 +263,11 @@ class VisionEngine:
         Minimum confidence for the initial detection.
     min_tracking_confidence : float
         Minimum confidence for subsequent tracking.
+    fretboard_ema_alpha : float
+        Smoothing factor for the Exponential Moving Average applied to the
+        detected fretboard y-coordinate across frames.  Must be in (0, 1].
+        Smaller values produce a smoother (slower-reacting) reference line;
+        larger values track raw detections more closely.  Default is 0.1.
     """
 
     def __init__(
@@ -271,6 +276,7 @@ class VisionEngine:
         max_num_hands: int = 1,
         min_hand_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
+        fretboard_ema_alpha: float = 0.1,
     ) -> None:
         resolved_model = _ensure_model(model_path)
 
@@ -292,6 +298,16 @@ class VisionEngine:
         # Absolute timestamp (seconds) until which the efficiency penalty is
         # suspended.  Negative means no active exemption.
         self._harmonic_release_until: float = -1.0
+
+        if not (0.0 < fretboard_ema_alpha <= 1.0):
+            raise ValueError(
+                f"fretboard_ema_alpha must be in (0, 1], got {fretboard_ema_alpha}"
+            )
+
+        # EMA state for fretboard_y stabilization.
+        # alpha controls responsiveness: small alpha → smoother but slower.
+        self._fretboard_ema_alpha: float = fretboard_ema_alpha
+        self._smoothed_fretboard_y: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -392,6 +408,21 @@ class VisionEngine:
 
         result.fingertips = fingertips
 
+<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
+        # --- 4. Update EMA for fretboard y-coordinate -----------------------
+        if fret_lines:
+            raw_fretboard_y = float(
+                np.mean([(ln[1] + ln[3]) / 2 for ln in fret_lines])
+            )
+            if self._smoothed_fretboard_y is None:
+                # First detection: seed the filter with the raw value.
+                self._smoothed_fretboard_y = raw_fretboard_y
+            else:
+                self._smoothed_fretboard_y = (
+                    self._fretboard_ema_alpha * raw_fretboard_y
+                    + (1.0 - self._fretboard_ema_alpha) * self._smoothed_fretboard_y
+                )
+=======
         # --- 3b. Compute fingertip velocities (pixels/frame) ------------------
         max_fingertip_velocity = 0.0
         for ft in fingertips:
@@ -469,18 +500,50 @@ class VisionEngine:
                     result.efficiency_score = 100.0
                 else:
                     result.efficiency_score = _compute_efficiency(avg_norm_dist)
+>>>>>>> main
 
-                # Overlay score on frame
-                cv2.putText(
+        # --- 5. Compute distances to smoothed fretboard reference line -------
+        if self._smoothed_fretboard_y is not None and fingertips:
+            ref_y = self._smoothed_fretboard_y
+            # Draw the smoothed reference line (thick cyan) over the raw lines.
+            cv2.line(
+                annotated,
+                (0, int(ref_y)),
+                (w, int(ref_y)),
+                (0, 255, 255),
+                2,
+            )
+
+            distances: list[float] = []
+            for ft in fingertips:
+                dist = abs(ft.y - ref_y)
+                distances.append(dist)
+                # Vertical drop line from fingertip to the reference
+                cv2.line(
                     annotated,
-                    f"Efficiency: {result.efficiency_score:.1f}%",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
+                    (int(ft.x), int(ft.y)),
+                    (int(ft.x), int(ref_y)),
+                    (255, 0, 255),
+                    1,
                 )
 
+<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
+            avg_dist = float(np.mean(distances))
+            result.avg_finger_height = avg_dist
+            result.fretboard_y = ref_y
+            result.efficiency_score = _compute_efficiency(avg_dist)
+
+            # Overlay score on frame
+            cv2.putText(
+                annotated,
+                f"Efficiency: {result.efficiency_score:.1f}%",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+            )
+=======
                 if in_harmonic_release:
                     cv2.putText(
                         annotated,
@@ -491,6 +554,7 @@ class VisionEngine:
                         (0, 255, 255),
                         2,
                     )
+>>>>>>> main
 
         result.annotated_frame = annotated
         return result

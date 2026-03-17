@@ -324,6 +324,7 @@ def run(args=None):
     prev_time = start_time
     fps = 0.0
     reference_y = frame_height // 2  # initial fallback
+    _EMA_ALPHA = 0.1                 # smoothing factor for reference-line EMA
 
     print(f"CSV output: {args.csv_output}")
     print("Press 'q' to quit.\n")
@@ -338,9 +339,12 @@ def run(args=None):
             elapsed = current_time - start_time
             timestamp_ms = int(elapsed * 1000)
 
-            # Dynamically detect reference line via Hough transform
-            reference_y = detect_reference_line(frame,
-                                                fallback_y=reference_y)
+            # Dynamically detect reference line via Hough transform and apply
+            # an Exponential Moving Average to suppress frame-to-frame jitter.
+            raw_y = detect_reference_line(frame, fallback_y=reference_y)
+            reference_y = int(
+                _EMA_ALPHA * raw_y + (1.0 - _EMA_ALPHA) * reference_y
+            )
 
             # Convert BGR → RGB and wrap in mp.Image
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

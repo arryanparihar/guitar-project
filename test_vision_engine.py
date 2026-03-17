@@ -264,5 +264,222 @@ class TestFretboardFallback(unittest.TestCase):
         self.assertEqual(engine._last_fret_lines, new_lines)
 
 
+# ---------------------------------------------------------------------------
+# Tests – Velocity Exemption / Harmonic Release
+# ---------------------------------------------------------------------------
+
+class TestHarmonicRelease(unittest.TestCase):
+    """Verify the Velocity Exemption / Harmonic Release feature."""
+
+    # ------------------------------------------------------------------
+    # Helper: build a VisionEngine with a fully-mocked MediaPipe stack
+    # and a fake hand landmark set.
+    # ------------------------------------------------------------------
+
+    @patch("vision_engine._ensure_model", return_value="/fake/model.task")
+    @patch("vision_engine.HandLandmarker")
+    def _make_engine_with_hand(self, mock_landmarker_cls, mock_ensure,
+                                tip_x=320.0, tip_y=100.0):
+        """
+        Return *(engine, mock_landmarker)* where the landmarker is set up
+        to return one hand whose four fingertips are all at (*tip_x*, *tip_y*)
+        in normalised coords (divided by frame 640×480).
+        """
+        mock_landmarker = MagicMock()
+        mock_landmarker_cls.create_from_options.return_value = mock_landmarker
+
+        # Build 21 fake landmarks; each fingertip (ids 8,12,16,20) sits at
+        # normalised (tip_x/640, tip_y/480).
+        def _make_hand(nx, ny):
+            lm_list = []
+            for i in range(21):
+                lm = MagicMock()
+                lm.x = nx
+                lm.y = ny
+                lm_list.append(lm)
+            return lm_list
+
+        nx = tip_x / 640.0
+        ny = tip_y / 480.0
+        mock_landmarker.detect.return_value = MagicMock(
+            hand_landmarks=[_make_hand(nx, ny)]
+        )
+        engine = vision_engine.VisionEngine(model_path="/fake/model.task")
+        return engine, mock_landmarker
+
+    @staticmethod
+    def _blank_frame():
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # ------------------------------------------------------------------
+    # Dataclass defaults
+    # ------------------------------------------------------------------
+
+    def test_frame_result_harmonic_release_default_false(self):
+        """FrameResult.harmonic_release should default to False."""
+        result = vision_engine.FrameResult(frame_index=0, timestamp_sec=0.0)
+        self.assertFalse(result.harmonic_release)
+
+    # ------------------------------------------------------------------
+    # register_onset
+    # ------------------------------------------------------------------
+
+    def test_register_onset_stores_timestamp(self):
+        """register_onset() should append the onset time to _recent_onsets."""
+        engine, _ = self._make_engine_with_hand()
+        self.assertEqual(engine._recent_onsets, [])
+        engine.register_onset(1.0)
+        engine.register_onset(2.5)
+        self.assertEqual(engine._recent_onsets, [1.0, 2.5])
+
+    # ------------------------------------------------------------------
+    # Initial state
+    # ------------------------------------------------------------------
+
+    def test_velocity_state_initialized(self):
+        """Velocity-exemption state should be empty / inactive on creation."""
+        engine, _ = self._make_engine_with_hand()
+        self.assertEqual(engine._prev_fingertip_positions, {})
+        self.assertEqual(engine._recent_onsets, [])
+        self.assertLess(engine._harmonic_release_until, 0.0)
+
+    # ------------------------------------------------------------------
+    # No exemption without a prior onset
+    # ------------------------------------------------------------------
+
+    @patch("vision_engine.detect_fretboard_lines")
+    def test_high_velocity_without_onset_no_exemption(self, mock_detect):
+        """High fingertip velocity alone (no onset) must NOT trigger Harmonic Release."""
+        mock_detect.return_value = [(0.0, 240.0, 640.0, 240.0)]
+        engine, _ = self._make_engine_with_hand(tip_x=320.0, tip_y=240.0)
+
+        # Directly manipulate: set previous position near fretboard, then
+        # process a frame with fingertips far away.
+        engine._prev_fingertip_positions = {
+            "index": (320.0, 240.0),
+            "middle": (320.0, 240.0),
+            "ring": (320.0, 240.0),
+            "pinky": (320.0, 240.0),
+        }
+        # No onset registered → should NOT be flagged as harmonic release.
+        result = engine.process_frame(self._blank_frame(), frame_index=1, fps=30.0)
+        self.assertFalse(result.harmonic_release)
+
+    # ------------------------------------------------------------------
+    # Onset too old → no exemption
+    # ------------------------------------------------------------------
+
+    @patch("vision_engine.detect_fretboard_lines")
+    def test_stale_onset_no_exemption(self, mock_detect):
+        """An onset older than ONSET_LOOKBACK_SEC should not trigger the exemption."""
+        mock_detect.return_value = [(0.0, 240.0, 640.0, 240.0)]
+        engine, _ = self._make_engine_with_hand(tip_x=320.0, tip_y=240.0)
+
+        # Register an onset at t=0.0, but process frame at t=10.0 (far too late).
+        engine.register_onset(0.0)
+        engine._prev_fingertip_positions = {
+            name: (320.0, 240.0) for name in vision_engine.FINGERTIP_NAMES
+        }
+
+        # frame_index=300 at 30fps → timestamp_sec=10.0
+        result = engine.process_frame(self._blank_frame(), frame_index=300, fps=30.0)
+        self.assertFalse(result.harmonic_release)
+
+    # ------------------------------------------------------------------
+    # Harmonic Release triggered
+    # ------------------------------------------------------------------
+
+    @patch("vision_engine.detect_fretboard_lines")
+    def test_harmonic_release_triggered_by_high_velocity_after_onset(self, mock_detect):
+        """
+        High-velocity fingertip movement within ONSET_LOOKBACK_SEC after an
+        onset must flag harmonic_release and set efficiency_score to 100.
+        """
+        mock_detect.return_value = [(0.0, 240.0, 640.0, 240.0)]
+        # Engine returns fingertips at y=50 (far from fretboard at y=240).
+        engine, _ = self._make_engine_with_hand(tip_x=320.0, tip_y=50.0)
+
+        # Register onset at t=0.0; process frame at t=0.1 (within lookback window).
+        engine.register_onset(0.0)
+
+        # Previous position right on the fretboard; current frame far away → big Δy.
+        engine._prev_fingertip_positions = {
+            name: (320.0, 240.0) for name in vision_engine.FINGERTIP_NAMES
+        }
+
+        # frame_index=3 at 30fps → timestamp_sec≈0.1; fingertips now at y=50 → Δ≈190px
+        result = engine.process_frame(self._blank_frame(), frame_index=3, fps=30.0)
+        self.assertTrue(result.harmonic_release)
+        self.assertEqual(result.efficiency_score, 100.0)
+
+    # ------------------------------------------------------------------
+    # Exemption window persists for HARMONIC_RELEASE_DURATION_SEC
+    # ------------------------------------------------------------------
+
+    @patch("vision_engine.detect_fretboard_lines")
+    def test_exemption_active_during_window(self, mock_detect):
+        """
+        Frames within HARMONIC_RELEASE_DURATION_SEC after the release must
+        remain exempt even if velocity is low.
+        """
+        mock_detect.return_value = [(0.0, 240.0, 640.0, 240.0)]
+        engine, _ = self._make_engine_with_hand(tip_x=320.0, tip_y=240.0)
+
+        # Directly set the exemption window active from t=0 to t=1.5.
+        engine._harmonic_release_until = 1.5
+
+        # Process at t=1.0 (inside window) with low velocity.
+        result = engine.process_frame(self._blank_frame(), frame_index=30, fps=30.0)
+        self.assertTrue(result.harmonic_release)
+        self.assertEqual(result.efficiency_score, 100.0)
+
+    # ------------------------------------------------------------------
+    # Exemption expired → normal scoring resumes
+    # ------------------------------------------------------------------
+
+    @patch("vision_engine.detect_fretboard_lines")
+    def test_exemption_expires_after_duration(self, mock_detect):
+        """
+        Once HARMONIC_RELEASE_DURATION_SEC has elapsed, normal efficiency
+        scoring must resume (score < 100 when fingertips are far away).
+        """
+        mock_detect.return_value = [(0.0, 240.0, 640.0, 240.0)]
+        engine, _ = self._make_engine_with_hand(tip_x=320.0, tip_y=240.0)
+
+        # Exemption window ended at t=0.5; process at t=2.0 (past expiry).
+        engine._harmonic_release_until = 0.5
+
+        result = engine.process_frame(self._blank_frame(), frame_index=60, fps=30.0)
+        self.assertFalse(result.harmonic_release)
+        # Fingertips at y=240 with fretboard at y=240 → distance≈0 → high score,
+        # but crucially harmonic_release is False and scoring is not exempted.
+        self.assertIsNotNone(result.efficiency_score)
+        self.assertLessEqual(result.efficiency_score, 100.0)
+
+    # ------------------------------------------------------------------
+    # Previous positions cleared when hand leaves frame
+    # ------------------------------------------------------------------
+
+    @patch("vision_engine._ensure_model", return_value="/fake/model.task")
+    @patch("vision_engine.HandLandmarker")
+    @patch("vision_engine.detect_fretboard_lines")
+    def test_prev_positions_cleared_when_hand_not_detected(
+        self, mock_detect, mock_landmarker_cls, mock_ensure
+    ):
+        """When no hand is detected, _prev_fingertip_positions must be cleared."""
+        mock_detect.return_value = []
+        mock_landmarker = MagicMock()
+        mock_landmarker.detect.return_value = MagicMock(hand_landmarks=[])
+        mock_landmarker_cls.create_from_options.return_value = mock_landmarker
+
+        engine = vision_engine.VisionEngine(model_path="/fake/model.task")
+        engine._prev_fingertip_positions = {
+            name: (100.0, 100.0) for name in vision_engine.FINGERTIP_NAMES
+        }
+
+        engine.process_frame(self._blank_frame(), frame_index=0)
+        self.assertEqual(engine._prev_fingertip_positions, {})
+
+
 if __name__ == "__main__":
     unittest.main()

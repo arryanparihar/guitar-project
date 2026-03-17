@@ -56,6 +56,24 @@ from mediapipe.tasks.python.vision import (
 FINGERTIP_IDS = (8, 12, 16, 20)   # INDEX, MIDDLE, RING, PINKY
 FINGERTIP_NAMES = ("index", "middle", "ring", "pinky")
 
+# ---------------------------------------------------------------------------
+# Velocity Exemption constants (Harmonic Release detection)
+# ---------------------------------------------------------------------------
+# Minimum fingertip speed (pixels per frame) that qualifies as a fast
+# release.  A guitarist pulling their hand away from the fretboard to let
+# a natural harmonic ring will typically exceed this in a 640×480 stream
+# at 30 fps.
+HARMONIC_VELOCITY_THRESHOLD: float = 15.0  # pixels per frame
+
+# How long (seconds) to suspend the efficiency penalty after a Harmonic
+# Release is flagged.
+HARMONIC_RELEASE_DURATION_SEC: float = 1.5
+
+# Maximum age of a registered audio onset (seconds) that is still
+# considered "immediately before" a high-velocity release.  Onsets older
+# than this value are discarded before the velocity check.
+ONSET_LOOKBACK_SEC: float = 0.5
+
 # Landmark index that must never be used for scoring (kept as a named
 # constant for documentation purposes and to prevent accidental re-addition).
 _THUMB_TIP_ID = 4  # excluded – thumb is behind the neck and not scored
@@ -124,6 +142,7 @@ class FrameResult:
     fretboard_y: Optional[float] = None          # y-coordinate of the nearest fretboard line
     avg_finger_height: Optional[float] = None    # mean distance (pixels) of fingertips from fretboard
     efficiency_score: Optional[float] = None     # 0–100 score for this frame
+    harmonic_release: bool = False               # True when velocity-exemption window is active
     annotated_frame: Optional[np.ndarray] = None # BGR image with drawn overlays
 
 
@@ -265,9 +284,37 @@ class VisionEngine:
         self._landmarker = HandLandmarker.create_from_options(options)
         self._last_fret_lines: list[tuple[float, float, float, float]] = []
 
+        # --- Velocity-exemption state (Harmonic Release detection) -----------
+        # Maps fingertip name → pixel coords from the previous processed frame.
+        self._prev_fingertip_positions: dict[str, tuple[float, float]] = {}
+        # Audio onset timestamps registered via register_onset().
+        self._recent_onsets: list[float] = []
+        # Absolute timestamp (seconds) until which the efficiency penalty is
+        # suspended.  Negative means no active exemption.
+        self._harmonic_release_until: float = -1.0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def register_onset(self, onset_time_sec: float) -> None:
+        """
+        Register a detected audio onset for harmonic-release detection.
+
+        Call this whenever the audio engine reports a note onset.  If a
+        fingertip subsequently moves away from the fretboard at an
+        exceptionally high velocity within :data:`ONSET_LOOKBACK_SEC`
+        seconds of *onset_time_sec*, ``process_frame`` will flag the result
+        as a ``harmonic_release`` and suspend the efficiency penalty for the
+        following :data:`HARMONIC_RELEASE_DURATION_SEC` seconds.
+
+        Parameters
+        ----------
+        onset_time_sec : float
+            Onset time in seconds (must share the same time-base as the
+            ``timestamp_sec`` values produced by ``process_frame``).
+        """
+        self._recent_onsets.append(onset_time_sec)
 
     def process_frame(
         self,
@@ -315,6 +362,9 @@ class VisionEngine:
         detection = self._landmarker.detect(mp_image)
 
         if not detection.hand_landmarks:
+            # No hand visible – reset velocity tracking so the next detected
+            # frame starts fresh rather than computing an erroneous delta.
+            self._prev_fingertip_positions = {}
             result.annotated_frame = annotated
             return result
 
@@ -341,6 +391,36 @@ class VisionEngine:
             cv2.circle(annotated, (int(fx), int(fy)), 6, (0, 0, 255), -1)
 
         result.fingertips = fingertips
+
+        # --- 3b. Compute fingertip velocities (pixels/frame) ------------------
+        max_fingertip_velocity = 0.0
+        for ft in fingertips:
+            prev = self._prev_fingertip_positions.get(ft.name)
+            if prev is not None:
+                vel = math.hypot(ft.x - prev[0], ft.y - prev[1])
+                if vel > max_fingertip_velocity:
+                    max_fingertip_velocity = vel
+        # Store current positions for the next frame
+        self._prev_fingertip_positions = {ft.name: (ft.x, ft.y) for ft in fingertips}
+
+        # --- 3c. Harmonic Release / Velocity Exemption check -----------------
+        # If we are already inside an active exemption window, honour it.
+        in_harmonic_release = timestamp_sec < self._harmonic_release_until
+        if not in_harmonic_release:
+            # Prune onsets that are too old to be "immediately before" this frame.
+            self._recent_onsets = [
+                t for t in self._recent_onsets
+                if timestamp_sec - t <= ONSET_LOOKBACK_SEC
+            ]
+            # Flag a new Harmonic Release when a fast departure follows an onset.
+            if (
+                max_fingertip_velocity >= HARMONIC_VELOCITY_THRESHOLD
+                and self._recent_onsets
+            ):
+                self._harmonic_release_until = timestamp_sec + HARMONIC_RELEASE_DURATION_SEC
+                in_harmonic_release = True
+
+        result.harmonic_release = in_harmonic_release
 
         # --- 4. Compute distances to fretboard --------------------------------
         if fret_lines and fingertips:
@@ -383,7 +463,12 @@ class VisionEngine:
                 else:
                     norm_distances = distances
                 avg_norm_dist = float(np.mean(norm_distances))
-                result.efficiency_score = _compute_efficiency(avg_norm_dist)
+
+                if in_harmonic_release:
+                    # Suspend efficiency penalty – score is 100 for this window.
+                    result.efficiency_score = 100.0
+                else:
+                    result.efficiency_score = _compute_efficiency(avg_norm_dist)
 
                 # Overlay score on frame
                 cv2.putText(
@@ -395,6 +480,17 @@ class VisionEngine:
                     (0, 255, 0),
                     2,
                 )
+
+                if in_harmonic_release:
+                    cv2.putText(
+                        annotated,
+                        "Harmonic Release",
+                        (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                    )
 
         result.annotated_frame = annotated
         return result

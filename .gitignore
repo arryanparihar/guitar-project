@@ -39,11 +39,12 @@ env/
 *.swp
 *.swo
 
-# Streamlit
-.streamlit/
+# Streamlit (keep config.toml but ignore secrets)
+.streamlit/secrets.toml
 
 # Temporary / uploaded files
 uploads/
+static/temp/
 *.mp4
 *.avi
 *.mov

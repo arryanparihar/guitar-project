@@ -31,7 +31,8 @@ def _make_streamlit_stub() -> types.ModuleType:
         "error", "spinner", "expander", "tabs", "progress",
         "download_button", "plotly_chart", "subheader", "metric",
         "video", "audio", "file_uploader", "json", "empty",
-        "image", "add_vline", "add_hline",
+        "image", "add_vline", "add_hline", "caption", "dataframe",
+        "success", "radio", "slider", "text_area",
     ):
         setattr(st, attr, _noop)
 
@@ -46,7 +47,23 @@ def _make_streamlit_stub() -> types.ModuleType:
     return st
 
 
+def _make_components_stub() -> types.ModuleType:
+    """Return a minimal streamlit.components.v1 stub."""
+    _noop = lambda *a, **kw: None  # noqa: E731
+    v1 = types.ModuleType("streamlit.components.v1")
+    v1.html = _noop
+    v1.iframe = _noop
+
+    components = types.ModuleType("streamlit.components")
+    components.v1 = v1
+
+    sys.modules["streamlit.components"] = components
+    sys.modules["streamlit.components.v1"] = v1
+    return components
+
+
 sys.modules.setdefault("streamlit", _make_streamlit_stub())
+_make_components_stub()
 
 # Now it is safe to import from main.
 from main import _build_finger_height_csv  # noqa: E402

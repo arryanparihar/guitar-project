@@ -408,21 +408,6 @@ class VisionEngine:
 
         result.fingertips = fingertips
 
-<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
-        # --- 4. Update EMA for fretboard y-coordinate -----------------------
-        if fret_lines:
-            raw_fretboard_y = float(
-                np.mean([(ln[1] + ln[3]) / 2 for ln in fret_lines])
-            )
-            if self._smoothed_fretboard_y is None:
-                # First detection: seed the filter with the raw value.
-                self._smoothed_fretboard_y = raw_fretboard_y
-            else:
-                self._smoothed_fretboard_y = (
-                    self._fretboard_ema_alpha * raw_fretboard_y
-                    + (1.0 - self._fretboard_ema_alpha) * self._smoothed_fretboard_y
-                )
-=======
         # --- 3b. Compute fingertip velocities (pixels/frame) ------------------
         max_fingertip_velocity = 0.0
         for ft in fingertips:
@@ -431,19 +416,19 @@ class VisionEngine:
                 vel = math.hypot(ft.x - prev[0], ft.y - prev[1])
                 if vel > max_fingertip_velocity:
                     max_fingertip_velocity = vel
-        # Store current positions for the next frame
-        self._prev_fingertip_positions = {ft.name: (ft.x, ft.y) for ft in fingertips}
+        # Only update previous positions when fingertips are actually detected;
+        # this prevents clearing the cache on occluded frames and avoids
+        # erroneous velocity spikes on the subsequent re-detection.
+        if fingertips:
+            self._prev_fingertip_positions = {ft.name: (ft.x, ft.y) for ft in fingertips}
 
         # --- 3c. Harmonic Release / Velocity Exemption check -----------------
-        # If we are already inside an active exemption window, honour it.
         in_harmonic_release = timestamp_sec < self._harmonic_release_until
         if not in_harmonic_release:
-            # Prune onsets that are too old to be "immediately before" this frame.
             self._recent_onsets = [
                 t for t in self._recent_onsets
                 if timestamp_sec - t <= ONSET_LOOKBACK_SEC
             ]
-            # Flag a new Harmonic Release when a fast departure follows an onset.
             if (
                 max_fingertip_velocity >= HARMONIC_VELOCITY_THRESHOLD
                 and self._recent_onsets
@@ -453,7 +438,20 @@ class VisionEngine:
 
         result.harmonic_release = in_harmonic_release
 
-        # --- 4. Compute distances to fretboard --------------------------------
+        # --- 4. Update EMA for fretboard y-coordinate (smoothed reference) ---
+        if fret_lines:
+            raw_fretboard_y = float(
+                np.mean([(ln[1] + ln[3]) / 2 for ln in fret_lines])
+            )
+            if self._smoothed_fretboard_y is None:
+                self._smoothed_fretboard_y = raw_fretboard_y
+            else:
+                self._smoothed_fretboard_y = (
+                    self._fretboard_ema_alpha * raw_fretboard_y
+                    + (1.0 - self._fretboard_ema_alpha) * self._smoothed_fretboard_y
+                )
+
+        # --- 4b. Compute distances to raw fret lines (harmonic-aware) --------
         if fret_lines and fingertips:
             distances: list[float] = []
             for ft in fingertips:
@@ -461,7 +459,6 @@ class VisionEngine:
                 if nearest_line:
                     dist = _point_to_line_distance(ft.x, ft.y, *nearest_line)
                     distances.append(dist)
-                    # Project fingertip vertically onto the nearest fretboard line
                     x1, y1, x2, y2 = nearest_line
                     dx = x2 - x1
                     dy = y2 - y1
@@ -488,7 +485,6 @@ class VisionEngine:
                     np.mean([(ln[1] + ln[3]) / 2 for ln in fret_lines])
                 )
 
-                # Normalise distances by hand reference scale
                 if hand_ref_scale > 0:
                     norm_distances = [d / hand_ref_scale for d in distances]
                 else:
@@ -496,11 +492,9 @@ class VisionEngine:
                 avg_norm_dist = float(np.mean(norm_distances))
 
                 if in_harmonic_release:
-                    # Suspend efficiency penalty – score is 100 for this window.
                     result.efficiency_score = 100.0
                 else:
                     result.efficiency_score = _compute_efficiency(avg_norm_dist)
->>>>>>> main
 
         # --- 5. Compute distances to smoothed fretboard reference line -------
         if self._smoothed_fretboard_y is not None and fingertips:
@@ -527,23 +521,6 @@ class VisionEngine:
                     1,
                 )
 
-<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
-            avg_dist = float(np.mean(distances))
-            result.avg_finger_height = avg_dist
-            result.fretboard_y = ref_y
-            result.efficiency_score = _compute_efficiency(avg_dist)
-
-            # Overlay score on frame
-            cv2.putText(
-                annotated,
-                f"Efficiency: {result.efficiency_score:.1f}%",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-            )
-=======
                 if in_harmonic_release:
                     cv2.putText(
                         annotated,
@@ -554,7 +531,6 @@ class VisionEngine:
                         (0, 255, 255),
                         2,
                     )
->>>>>>> main
 
         result.annotated_frame = annotated
         return result

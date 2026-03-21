@@ -1,0 +1,5 @@
+[server]
+# Serve the ./static/ directory at /app/static/ so that uploaded audio
+# files can be referenced by URL inside the HTML component without
+# Base64-encoding (which would crash the browser for large files).
+enableStaticServing = true

@@ -31,7 +31,8 @@ def _make_streamlit_stub() -> types.ModuleType:
         "error", "spinner", "expander", "tabs", "progress",
         "download_button", "plotly_chart", "subheader", "metric",
         "video", "audio", "file_uploader", "json", "empty",
-        "image", "add_vline", "add_hline",
+        "image", "add_vline", "add_hline", "caption", "number_input",
+        "slider", "text_area", "session_state",
     ):
         setattr(st, attr, _noop)
 
@@ -40,13 +41,35 @@ def _make_streamlit_stub() -> types.ModuleType:
         **{a: _noop for a in (
             "image", "title", "markdown", "divider", "subheader",
             "radio", "slider", "number_input", "checkbox",
+            "file_uploader", "success", "error",
         )}
     )
     st.sidebar = sidebar
+
+    # st.session_state must behave like a dict / namespace
+    st.session_state = {}
+
     return st
 
 
-sys.modules.setdefault("streamlit", _make_streamlit_stub())
+def _make_streamlit_components_stub() -> types.ModuleType:
+    """Return a minimal streamlit.components.v1 stub."""
+    comp_v1 = types.ModuleType("streamlit.components.v1")
+    comp_v1.html = lambda *a, **kw: None
+    comp_v1.declare_component = lambda *a, **kw: None
+
+    comp = types.ModuleType("streamlit.components")
+    comp.v1 = comp_v1
+
+    return comp, comp_v1
+
+
+_st_stub = _make_streamlit_stub()
+_comp_stub, _comp_v1_stub = _make_streamlit_components_stub()
+
+sys.modules.setdefault("streamlit", _st_stub)
+sys.modules.setdefault("streamlit.components", _comp_stub)
+sys.modules.setdefault("streamlit.components.v1", _comp_v1_stub)
 
 # Now it is safe to import from main.
 from main import _build_finger_height_csv  # noqa: E402

@@ -54,6 +54,7 @@ class AudioSyncer:
         wait: int = 8,
         pre_max: int = 3,
         median_filter_size: int = 3,
+        threshold_ignore_sec: float = 0.0,
     ) -> None:
         if sample_rate <= 0:
             raise ValueError(f"sample_rate must be positive, got {sample_rate}")
@@ -67,12 +68,17 @@ class AudioSyncer:
             raise ValueError(
                 f"median_filter_size must be at least 1, got {median_filter_size}"
             )
+        if threshold_ignore_sec < 0:
+            raise ValueError(
+                f"threshold_ignore_sec must be non-negative, got {threshold_ignore_sec}"
+            )
 
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.wait = wait
         self.pre_max = pre_max
         self.median_filter_size = median_filter_size
+        self.threshold_ignore_sec = threshold_ignore_sec
 
     # ------------------------------------------------------------------
     # Public API
@@ -159,6 +165,12 @@ class AudioSyncer:
                 hop_length=self.hop_length,
             ).tolist()
         )
+
+        # --- Step 7: Filter out count-in / pre-roll onsets ---------------
+        if self.threshold_ignore_sec > 0:
+            onset_times = [
+                t for t in onset_times if t >= self.threshold_ignore_sec
+            ]
 
         return onset_times
 

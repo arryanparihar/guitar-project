@@ -408,7 +408,6 @@ class VisionEngine:
 
         result.fingertips = fingertips
 
-<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
         # --- 4. Update EMA for fretboard y-coordinate -----------------------
         if fret_lines:
             raw_fretboard_y = float(
@@ -422,7 +421,7 @@ class VisionEngine:
                     self._fretboard_ema_alpha * raw_fretboard_y
                     + (1.0 - self._fretboard_ema_alpha) * self._smoothed_fretboard_y
                 )
-=======
+
         # --- 3b. Compute fingertip velocities (pixels/frame) ------------------
         max_fingertip_velocity = 0.0
         for ft in fingertips:
@@ -453,55 +452,6 @@ class VisionEngine:
 
         result.harmonic_release = in_harmonic_release
 
-        # --- 4. Compute distances to fretboard --------------------------------
-        if fret_lines and fingertips:
-            distances: list[float] = []
-            for ft in fingertips:
-                nearest_line = _nearest_fretboard_line(ft.y, fret_lines)
-                if nearest_line:
-                    dist = _point_to_line_distance(ft.x, ft.y, *nearest_line)
-                    distances.append(dist)
-                    # Project fingertip vertically onto the nearest fretboard line
-                    x1, y1, x2, y2 = nearest_line
-                    dx = x2 - x1
-                    dy = y2 - y1
-                    denom = dx * dx + dy * dy
-                    if denom > 0:
-                        t = ((ft.x - x1) * dx + (ft.y - y1) * dy) / denom
-                        t = max(0.0, min(1.0, t))
-                        proj_x = int(x1 + t * dx)
-                        proj_y = int(y1 + t * dy)
-                    else:
-                        proj_x, proj_y = int(x1), int(y1)
-                    cv2.line(
-                        annotated,
-                        (int(ft.x), int(ft.y)),
-                        (proj_x, proj_y),
-                        (255, 0, 255),
-                        1,
-                    )
-
-            if distances:
-                avg_dist = float(np.mean(distances))
-                result.avg_finger_height = avg_dist
-                result.fretboard_y = float(
-                    np.mean([(ln[1] + ln[3]) / 2 for ln in fret_lines])
-                )
-
-                # Normalise distances by hand reference scale
-                if hand_ref_scale > 0:
-                    norm_distances = [d / hand_ref_scale for d in distances]
-                else:
-                    norm_distances = distances
-                avg_norm_dist = float(np.mean(norm_distances))
-
-                if in_harmonic_release:
-                    # Suspend efficiency penalty – score is 100 for this window.
-                    result.efficiency_score = 100.0
-                else:
-                    result.efficiency_score = _compute_efficiency(avg_norm_dist)
->>>>>>> main
-
         # --- 5. Compute distances to smoothed fretboard reference line -------
         if self._smoothed_fretboard_y is not None and fingertips:
             ref_y = self._smoothed_fretboard_y
@@ -527,11 +477,13 @@ class VisionEngine:
                     1,
                 )
 
-<<<<<<< copilot/add-ema-for-fretboard-y-coordinate
             avg_dist = float(np.mean(distances))
             result.avg_finger_height = avg_dist
             result.fretboard_y = ref_y
-            result.efficiency_score = _compute_efficiency(avg_dist)
+            if in_harmonic_release:
+                result.efficiency_score = 100.0
+            else:
+                result.efficiency_score = _compute_efficiency(avg_dist)
 
             # Overlay score on frame
             cv2.putText(
@@ -543,18 +495,16 @@ class VisionEngine:
                 (0, 255, 0),
                 2,
             )
-=======
-                if in_harmonic_release:
-                    cv2.putText(
-                        annotated,
-                        "Harmonic Release",
-                        (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 255, 255),
-                        2,
-                    )
->>>>>>> main
+            if in_harmonic_release:
+                cv2.putText(
+                    annotated,
+                    "Harmonic Release",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2,
+                )
 
         result.annotated_frame = annotated
         return result
